@@ -27,7 +27,7 @@ claude    = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 groq      = Groq(api_key=os.environ["GROQ_API_KEY"])
 supabase  = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-INVITE_CODE  = os.environ.get("INVITE_CODE", "brunopadelcoach")  # código secreto de invitación
+INVITE_CODE  = os.environ.get("INVITE_CODE", "padel2024")  # código secreto de invitación
 ADMIN_IDS    = set(int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip())
 
 # Cache en memoria para evitar consultas a Supabase en cada mensaje
@@ -489,12 +489,80 @@ Ejemplo con historial: {{"resultado": "6-4 / 3-6", "saque": 6, "devolucion": 7, 
     except Exception:
         return {}
 
+def buscar_conocimiento(query: str, nivel: str, limite: int = 5) -> str:
+    """
+    Busca en la base de conocimiento de pádel usando full-text search.
+    Retorna texto formateado listo para inyectar en el prompt de Claude.
+    """
+    try:
+        # Mapear nivel inferido a categoría de conocimiento
+        nivel_map = {
+            "6ta": "principiante", "5ta baja": "principiante",
+            "5ta": "principiante", "5ta alta": "principiante",
+            "4ta baja": "intermedio", "4ta": "intermedio", "4ta alta": "intermedio",
+            "3ra baja": "avanzado", "3ra": "avanzado", "3ra alta": "avanzado",
+            "2da": "avanzado", "1ra": "avanzado",
+        }
+        nivel_conocimiento = nivel_map.get(nivel, "principiante")
+
+        # Búsqueda full-text — busca en título, golpe, contenido y frase_coach
+        resp = supabase.rpc("buscar_conocimiento_padel", {
+            "query_text": query,
+            "nivel_fil":  nivel_conocimiento,
+            "lim":        limite,
+        }).execute()
+
+        resultados = resp.data or []
+
+        if not resultados:
+            # Fallback: traer los más relevantes por nivel sin búsqueda textual
+            resp2 = (supabase.table("conocimiento_padel")
+                     .select("titulo,categoria,contenido,frase_coach,media_url")
+                     .eq("activo", True)
+                     .in_("nivel_objetivo", [nivel_conocimiento, "todos"])
+                     .limit(limite)
+                     .execute())
+            resultados = resp2.data or []
+
+        if not resultados:
+            return ""
+
+        # Formatear para el prompt
+        bloques = []
+        for r in resultados:
+            bloque = f"### {r.get('titulo','')}"
+            if r.get("contenido"):
+                bloque += f"\n{r['contenido']}"
+            if r.get("frase_coach"):
+                bloque += f"\n💬 Frase clave: \"{r['frase_coach']}\""
+            if r.get("media_url"):
+                bloque += f"\n🎥 Referencia: {r['media_url']}"
+            bloques.append(bloque)
+
+        return "\n\n".join(bloques)
+
+    except Exception as e:
+        log.warning(f"Error buscando conocimiento: {e}")
+        return ""
+
 def analizar_con_claude(draft: dict, historial: list, nivel_inferido: str) -> dict:
     """Genera el análisis completo del partido como coach con memoria acumulada."""
 
     desc_nivel = CATEGORIAS_DESC.get(nivel_inferido, "")
 
-    # Construir contexto rico del historial
+    # Buscar conocimiento relevante según lo que pasó en el partido
+    query_conocimiento = " ".join(filter(None, [
+        draft.get("error_golpe", ""),
+        draft.get("error_tactico", ""),
+        draft.get("golpe_bueno", ""),
+        draft.get("patron_bueno", ""),
+    ])) or "técnica básica posicionamiento"
+
+    conocimiento = buscar_conocimiento(query_conocimiento, nivel_inferido)
+    bloque_conocimiento = f"""
+CONOCIMIENTO TÉCNICO RELEVANTE (úsalo para dar consejos específicos, no genéricos):
+{conocimiento}
+""" if conocimiento else ""
     if historial:
         ctx = construir_contexto_historial(historial)
         promedios_txt = json.dumps(ctx, ensure_ascii=False, indent=2)
@@ -536,6 +604,7 @@ Descripción: {desc_nivel}
 
 DATOS DEL PARTIDO DE HOY:
 {json.dumps(draft, ensure_ascii=False, indent=2)}
+{bloque_conocimiento}
 {hist_bloque}
 {instrucciones_hist}
 
