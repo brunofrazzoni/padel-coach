@@ -490,34 +490,61 @@ Ejemplo con historial: {{"resultado": "6-4 / 3-6", "saque": 6, "devolucion": 7, 
         return {}
 
 def analizar_con_claude(draft: dict, historial: list, nivel_inferido: str) -> dict:
-    """Genera el análisis completo del partido, usando el nivel inferido por el bot."""
-
-    hist_txt = ""
-    if historial:
-        hist_txt = "Historial reciente (más reciente primero):\n" + "\n".join(
-            f"- {str(p.get('fecha','?'))[:10]}: resultado={p.get('resultado','?')} "
-            f"T={p.get('score_tecnica','?')} TÁC={p.get('score_tactica','?')} EM={p.get('score_emocional','?')} "
-            f"rivales={p.get('nivel_rivales','?')}"
-            for p in historial[:5]
-        )
+    """Genera el análisis completo del partido como coach con memoria acumulada."""
 
     desc_nivel = CATEGORIAS_DESC.get(nivel_inferido, "")
 
-    prompt = f"""Eres un coach de pádel experto con formación en psicología deportiva.
+    # Construir contexto rico del historial
+    if historial:
+        ctx = construir_contexto_historial(historial)
+        promedios_txt = json.dumps(ctx, ensure_ascii=False, indent=2)
 
-NIVEL ACTUAL DEL JUGADOR (inferido por el sistema): {nivel_inferido}
-Descripción de este nivel: {desc_nivel}
+        # Detectar tendencias por dimensión
+        partidos_txt = "\n".join(
+            f"- {str(p.get('fecha','?'))[:10]}: resultado={p.get('resultado','?')} "
+            f"rivales={p.get('nivel_rivales','?')} "
+            f"T={p.get('score_tecnica','?')} TÁC={p.get('score_tactica','?')} EM={p.get('score_emocional','?')} "
+            f"prioridad='{json.loads(p['analisis_raw']).get('prioridad_semana','') if p.get('analisis_raw') else ''}'"
+            for p in historial[:5]
+        )
 
-DATOS DEL PARTIDO:
+        hist_bloque = f"""
+HISTORIAL DE PARTIDOS (más reciente primero):
+{partidos_txt}
+
+PROMEDIOS HISTÓRICOS (baseline del jugador):
+{promedios_txt}
+"""
+        instrucciones_hist = f"""
+INSTRUCCIONES CON HISTORIAL — CRÍTICAS:
+- NO resumas lo que el usuario ya te dijo del partido. Eso lo sabe. Tu valor está en lo que él NO ve.
+- Detecta si algo que fue problema antes mejoró hoy → celébralo explícitamente ("la semana pasada tu saque fallaba, hoy estuvo sólido").
+- Detecta si un punto débil recurrente volvió a aparecer → nómbralo con datos ("esto ya apareció en 3 de tus últimos 5 partidos").
+- Detecta si la prioridad de la semana pasada se cumplió o no, y comenta.
+- Celebra tendencias positivas con datos concretos del historial.
+- La prioridad de esta semana debe ser diferente a la del partido anterior, a menos que siga siendo el punto más crítico.
+- Si hay un patrón emocional recurrente (ej. hoyos emocionales en momentos de presión), trabájalo explícitamente.
+"""
+    else:
+        hist_bloque = "\nPRIMER PARTIDO REGISTRADO — sin historial previo."
+        instrucciones_hist = "- Es el primer partido. Establece una línea base clara y sé alentador."
+
+    prompt = f"""Eres un coach de pádel con memoria de todos los partidos del jugador. Tu rol NO es resumir lo que pasó — el jugador ya lo sabe. Tu rol es actuar como un coach que ha seguido su progreso, que recuerda sus debilidades, celebra sus avances reales y traza el camino hacia la siguiente categoría.
+
+NIVEL ACTUAL: {nivel_inferido}
+Descripción: {desc_nivel}
+
+DATOS DEL PARTIDO DE HOY:
 {json.dumps(draft, ensure_ascii=False, indent=2)}
+{hist_bloque}
+{instrucciones_hist}
 
-{hist_txt}
-
-INSTRUCCIONES IMPORTANTES:
-- Todos tus consejos deben ser apropiados para un jugador de {nivel_inferido}.
-- Los consejos técnicos/tácticos deben enfocarse en lo que corresponde a su nivel (no pidas víbora a un jugador de 5ta, ni solo trabajes el saque con uno de 3ra).
-- Celebra progresos reales, no infles los logros.
-- Si el nivel de los rivales fue más alto que el propio y el resultado fue competitivo o ganado, reconócelo explícitamente.
+REGLAS GENERALES:
+- Tono: directo, cercano, como un coach que te conoce. No formal, no genérico.
+- Consejos apropiados para {nivel_inferido} — ni muy básicos ni fuera de alcance.
+- Si ganaron a rivales de categoría superior, reconócelo.
+- Celebra progresos reales con evidencia del historial, no elogios vacíos.
+- Un solo consejo por dimensión — el más importante, no una lista.
 
 Responde SOLO con este JSON (sin markdown):
 {{
@@ -525,17 +552,17 @@ Responde SOLO con este JSON (sin markdown):
   "score_tactica": <promedio de posicionamiento+uso_red+construccion+gestion_marcador, un decimal>,
   "score_emocional": <promedio de (10-ansiedad)+foco+gestion_errores+comunicacion dividido 4, un decimal>,
   "nivel_inferido": "{nivel_inferido}",
-  "emoji_partido": "<un emoji representativo>",
-  "resumen": "<2-3 frases directas del partido. Empieza con algo positivo real.>",
-  "celebracion_tecnica": "<qué hizo bien técnicamente, específico para su nivel>",
-  "celebracion_tactica": "<qué hizo bien tácticamente, específico>",
-  "celebracion_emocional": "<celebra si fue bueno, sé honesto si fue malo>",
-  "consejo_tecnico": "<UN consejo técnico accionable y apropiado para {nivel_inferido}>",
-  "consejo_tactico": "<UN consejo táctico con ejercicio o frase clave>",
-  "consejo_emocional": "<herramienta concreta: respiración, frase ancla, rutina>",
-  "prioridad_semana": "<una frase: la prioridad #1 para entrenar esta semana>",
-  "patron_detectado": "<si hay historial, comenta repeticiones buenas y malas. Si es el primero, dilo.>",
-  "mensaje_nivel": "<una frase sobre su nivel actual y qué necesita para subir a la siguiente categoría>"
+  "emoji_partido": "<emoji representativo del partido>",
+  "resumen": "<1-2 frases que capturen la narrativa del partido — qué tipo de partido fue, no los datos>",
+  "celebracion_tecnica": "<algo técnico que mejoró vs historial o fue consistentemente bueno. Con referencia al historial si existe.>",
+  "celebracion_tactica": "<logro táctico real de hoy. Conecta con lo que venían trabajando si hay historial.>",
+  "celebracion_emocional": "<celebra manejo emocional si fue bueno. Si hubo hoyos pero salieron, reconoce la resiliencia. Honesto pero constructivo.>",
+  "consejo_tecnico": "<el error técnico más importante de hoy, con una corrección concreta y práctica para su nivel>",
+  "consejo_tactico": "<ajuste táctico específico. Si es un patrón recurrente del historial, dilo.>",
+  "consejo_emocional": "<si hay patrón emocional recurrente, nómbralo. Da una herramienta concreta: respiración, frase ancla, rutina entre puntos.>",
+  "prioridad_semana": "<UNA sola prioridad de entrenamiento para esta semana. Diferente a la semana pasada si ya fue trabajada.>",
+  "patron_detectado": "<el insight más valioso que solo se ve mirando el historial completo. Algo que el jugador no vería partido a partido.>",
+  "mensaje_nivel": "<qué falta específicamente para subir de {nivel_inferido} a la siguiente categoría, basado en lo que ves hoy>"
 }}"""
 
     resp = claude.messages.create(
@@ -543,7 +570,12 @@ Responde SOLO con este JSON (sin markdown):
         max_tokens=1400,
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = resp.content[0].text.strip()
+    resp = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1400,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw   = resp.content[0].text.strip()
     clean = re.sub(r"```json|```", "", raw).strip()
     return json.loads(clean)
 
@@ -615,7 +647,7 @@ HISTORIAL ({len(historial)} partidos, más reciente primero):
 {chr(10).join(hist_lines)}
 
 REGLAS:
-1. El nivel base viene de una evaluación técnica rigurosa — dale peso alto.
+1. El nivel base viene de una evaluación técnica rigurosa - dale peso alto.
 2. Sube una subcategoría si: score técnico+táctico promedio > 7 en los últimos 3 partidos Y resultados competitivos vs rivales de categoría similar o superior.
 3. Baja una subcategoría si: score técnico+táctico promedio < 4 en los últimos 3 partidos Y pierde consistentemente vs rivales de su misma categoría.
 4. Con menos de 5 partidos, solo sube/baja si la evidencia es muy clara.
@@ -761,18 +793,6 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
                                 texto: str, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(chat_id)
 
-    # Cargar historial una sola vez por sesión y guardarlo en memoria
-    if "historial" not in session:
-        session["historial"] = obtener_historial(user_id, limite=5)
-        if session["historial"]:
-            n = len(session["historial"])
-            await context.bot.send_message(
-                chat_id,
-                f"📚 _Cargué tu historial de {n} partido{'s' if n>1 else ''} anterior{'es' if n>1 else ''}. "
-                f"Puedes decirme cosas como \"igual que siempre\" o \"todo bien menos el saque\"._",
-                parse_mode=ParseMode.MARKDOWN
-            )
-
     # Si estamos esperando un campo manual específico
     if session["step"] == "waiting_manual" and session.get("pending_field"):
         campo = session["pending_field"]
@@ -826,13 +846,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if autorizado(user.id):
         perfil = obtener_perfil(user.id)
         if perfil:
-            sessions[chat_id] = {"draft": {}, "step": "waiting_input", "pending_field": None}
+            historial = obtener_historial(user.id, limite=5)
+            sessions[chat_id] = {
+                "draft": {}, "step": "waiting_input",
+                "pending_field": None, "historial": historial,
+            }
             nivel    = perfil.get("nivel_actual", "—")
             partidos = perfil.get("partidos_total", 0)
+            hist_msg = ""
+            if historial:
+                n = len(historial)
+                hist_msg = (f"\n📚 _Cargué tu historial de {n} partido{'s' if n>1 else ''} anterior{'es' if n>1 else ''}. "
+                           f"Puedes decirme cosas como \"igual que siempre\" o \"todo bien menos el saque\"._")
             await update.message.reply_text(
                 f"👋 Bienvenido de vuelta, {user.first_name}.\n\n"
                 f"📊 Nivel actual: *{nivel}* · Partidos registrados: *{partidos}*\n\n"
-                "Cuando termines un partido, cuéntame qué pasó.\n\n"
+                f"Cuando termines un partido, cuéntame qué pasó.{hist_msg}\n\n"
                 "Comandos: /nuevo · /resumen · /historial · /minivel",
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -1021,8 +1050,22 @@ async def cmd_minivel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not autorizado(update.effective_user.id):
         return
-    sessions[update.effective_chat.id] = {"draft": {}, "step": "waiting_input", "pending_field": None}
-    await update.message.reply_text("✅ Sesión reiniciada. Cuéntame del partido.")
+    user_id  = update.effective_user.id
+    chat_id  = update.effective_chat.id
+    historial = obtener_historial(user_id, limite=5)
+    sessions[chat_id] = {
+        "draft": {}, "step": "waiting_input",
+        "pending_field": None, "historial": historial,
+    }
+    hist_msg = ""
+    if historial:
+        n = len(historial)
+        hist_msg = (f"\n📚 _Cargué tu historial de {n} partido{'s' if n>1 else ''} anterior{'es' if n>1 else ''}. "
+                   f"Puedes decirme cosas como \"igual que siempre\" o \"todo bien menos el saque\"._")
+    await update.message.reply_text(
+        f"✅ Listo. Cuéntame del partido.{hist_msg}",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Verifica que el bot está vivo y que Supabase responde."""
