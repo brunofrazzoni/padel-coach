@@ -858,6 +858,33 @@ async def mostrar_resumen_y_confirmar(chat_id: int, context: ContextTypes.DEFAUL
         reply_markup=teclado_confirmacion_final()
     )
 
+def detectar_intent(texto: str) -> str:
+    """
+    Detecta si el usuario está pidiendo una acción del sistema
+    en vez de reportar un partido. Retorna el intent o 'partido'.
+    Rápido y barato — sin llamada a Claude, solo reglas semánticas simples.
+    """
+    t = texto.lower().strip()
+
+    historial_keywords = ["historial", "partidos anteriores", "mis partidos", "cuántos partidos", "cuantos partidos", "últimos partidos", "ultimos partidos"]
+    nivel_keywords     = ["mi nivel", "cómo voy", "como voy", "qué nivel", "que nivel", "mi progreso", "progreso", "cuánto he mejorado", "cuanto he mejorado", "en qué categoría", "en que categoria"]
+    resumen_keywords   = ["último análisis", "ultimo analisis", "último partido", "ultimo partido", "qué fue lo último", "que fue lo ultimo", "lo que trabajamos", "resumen", "mi análisis", "mi analisis"]
+    nuevo_keywords     = ["nuevo partido", "registrar partido", "quiero registrar", "empezar partido", "partido nuevo", "agregar partido"]
+    ayuda_keywords     = ["ayuda", "comandos", "qué puedes hacer", "que puedes hacer", "cómo funciona", "como funciona", "qué haces", "que haces"]
+
+    for kw in historial_keywords:
+        if kw in t: return "historial"
+    for kw in nivel_keywords:
+        if kw in t: return "minivel"
+    for kw in resumen_keywords:
+        if kw in t: return "resumen"
+    for kw in nuevo_keywords:
+        if kw in t: return "nuevo"
+    for kw in ayuda_keywords:
+        if kw in t: return "ayuda"
+
+    return "partido"
+
 async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
                                 texto: str, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(chat_id)
@@ -912,6 +939,40 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
         return
 
     # Extracción con historial como contexto
+    # Pero primero — detectar si el usuario está pidiendo algo del sistema
+    if session.get("step") == "waiting_input":
+        intent = detectar_intent(texto)
+        if intent == "historial":
+            await cmd_historial_chat(chat_id, user_id, context)
+            return
+        elif intent == "minivel":
+            await cmd_minivel_chat(chat_id, user_id, context)
+            return
+        elif intent == "resumen":
+            await cmd_resumen_chat(chat_id, user_id, context)
+            return
+        elif intent == "nuevo":
+            historial = obtener_historial(user_id, limite=5)
+            sessions[chat_id] = {
+                "draft": {}, "step": "waiting_input",
+                "pending_field": None, "historial": historial,
+            }
+            await context.bot.send_message(chat_id, "✅ Listo. Cuéntame del partido.")
+            return
+        elif intent == "ayuda":
+            await context.bot.send_message(
+                chat_id,
+                "🎾 *Puedo ayudarte con:*\n\n"
+                "• Contarme de un partido (audio o texto)\n"
+                "• _\"cómo voy\"_ — tu nivel y progreso\n"
+                "• _\"mis partidos\"_ — historial\n"
+                "• _\"último análisis\"_ — resumen del partido anterior\n"
+                "• _\"nuevo partido\"_ — empezar registro\n\n"
+                "No necesitas usar comandos con `/` — escribe nomás.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
     extraido = extraer_datos_claude(texto, session["draft"], session.get("historial", []))
 
@@ -1195,6 +1256,67 @@ async def cmd_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     sessions.pop(update.effective_chat.id, None)
     await update.message.reply_text("🗑 Sesión borrada.")
+
+async def cmd_historial_chat(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Versión de cmd_historial invocable desde texto libre."""
+    partidos = obtener_historial(user_id, limite=5)
+    if not partidos:
+        await context.bot.send_message(chat_id, "Sin partidos registrados aún.")
+        return
+    lines = ["*Últimos partidos:*\n"]
+    for p in partidos:
+        fecha = str(p.get("fecha", "?"))[:10]
+        lines.append(
+            f"📅 {fecha} — {p.get('resultado','?')} · "
+            f"T:{p.get('score_tecnica','?')} "
+            f"TÁC:{p.get('score_tactica','?')} "
+            f"EM:{p.get('score_emocional','?')}"
+        )
+    await context.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_minivel_chat(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Versión de cmd_minivel invocable desde texto libre."""
+    perfil = obtener_perfil(user_id)
+    if not perfil:
+        await context.bot.send_message(chat_id, "Aún no tienes perfil. Escribe /start para crear uno.")
+        return
+    nivel_inicial = perfil.get("nivel_inicial", "—")
+    nivel_actual  = perfil.get("nivel_actual",  "—")
+    partidos      = perfil.get("partidos_total", 0)
+    desc_actual   = CATEGORIAS_DESC.get(nivel_actual, "")
+    idx_inicial   = CATEGORIAS.index(nivel_inicial) if nivel_inicial in CATEGORIAS else 0
+    idx_actual    = CATEGORIAS.index(nivel_actual)  if nivel_actual  in CATEGORIAS else 0
+    subio         = idx_actual - idx_inicial
+    if subio > 0:
+        progreso_txt = f"📈 Subiste *{subio}* categoría(s) desde que empezaste."
+    elif subio < 0:
+        progreso_txt = f"📉 Bajaste *{abs(subio)}* categoría(s) desde tu evaluación inicial."
+    else:
+        progreso_txt = "➡️ Mismo nivel que al inicio — sigue acumulando partidos."
+    siguiente_txt = ""
+    if idx_actual < len(CATEGORIAS) - 1:
+        siguiente = CATEGORIAS[idx_actual + 1]
+        siguiente_txt = f"\n\n🎯 *Para subir a {siguiente}:*\n_{CATEGORIAS_DESC.get(siguiente,'')}_"
+    await context.bot.send_message(
+        chat_id,
+        f"📊 *Tu nivel de pádel*\n\n"
+        f"🏁 Nivel inicial: *{nivel_inicial}*\n"
+        f"🎾 Nivel actual: *{nivel_actual}*\n"
+        f"📅 Partidos registrados: *{partidos}*\n\n"
+        f"{progreso_txt}{siguiente_txt}",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def cmd_resumen_chat(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Versión de cmd_resumen invocable desde texto libre."""
+    partidos = obtener_historial(user_id, limite=1)
+    if not partidos:
+        await context.bot.send_message(chat_id, "Sin partidos registrados aún.")
+        return
+    p       = partidos[0]
+    analisis = json.loads(p.get("analisis_raw", "{}")) if isinstance(p.get("analisis_raw"), str) else (p.get("analisis_raw") or {})
+    draft    = json.loads(p.get("datos_raw",    "{}")) if isinstance(p.get("datos_raw"),    str) else (p.get("datos_raw")    or {})
+    await enviar_analisis(chat_id, context, analisis, draft)
 
 async def cmd_historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not autorizado(update.effective_user.id):
