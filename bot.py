@@ -27,9 +27,36 @@ claude    = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 groq      = Groq(api_key=os.environ["GROQ_API_KEY"])
 supabase  = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-ALLOWED   = set(int(x) for x in os.environ.get("ALLOWED_USER_IDS","").split(",") if x.strip())
+INVITE_CODE  = os.environ.get("INVITE_CODE", "padel2024")  # código secreto de invitación
+ADMIN_IDS    = set(int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip())
 
-# ── ESTADO DE SESIÓN (en memoria — persiste mientras el bot corre) ────────────
+# Cache en memoria para evitar consultas a Supabase en cada mensaje
+_autorizados_cache: set[int] = set()
+
+def autorizado(user_id: int) -> bool:
+    """Verifica si el usuario está autorizado (en cache o en Supabase)."""
+    if user_id in _autorizados_cache:
+        return True
+    if user_id in ADMIN_IDS:
+        return True
+    # Consultar Supabase
+    try:
+        resp = supabase.table("usuarios_autorizados").select("user_id").eq("user_id", str(user_id)).limit(1).execute()
+        if resp.data:
+            _autorizados_cache.add(user_id)
+            return True
+    except Exception as e:
+        log.error(f"Error verificando autorización: {e}")
+    return False
+
+def autorizar_usuario(user_id: int, username: str) -> None:
+    """Registra al usuario como autorizado en Supabase."""
+    supabase.table("usuarios_autorizados").upsert({
+        "user_id":    str(user_id),
+        "username":   username,
+        "fecha_alta": datetime.utcnow().isoformat(),
+    }, on_conflict="user_id").execute()
+    _autorizados_cache.add(user_id)
 # sessions[chat_id] = { "draft": {...}, "step": "waiting_input"|"confirming"|"done" }
 sessions: dict = {}
 
@@ -277,9 +304,6 @@ CAMPOS_OPCIONALES = {
 ESCALAS_0_10 = {k for k in list(CAMPOS.keys())[2:]}  # todos excepto resultado y nivel_rivales
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
-
-def autorizado(user_id: int) -> bool:
-    return not ALLOWED or user_id in ALLOWED
 
 def get_session(chat_id: int) -> dict:
     if chat_id not in sessions:
@@ -686,40 +710,72 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
 # ── HANDLERS DE TELEGRAM ──────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorizado(update.effective_user.id):
-        return
-    user = update.effective_user
-    perfil = obtener_perfil(user.id)
+    user     = update.effective_user
+    chat_id  = update.effective_chat.id
+    args     = context.args  # texto después de /start
 
-    if perfil:
-        # Ya tiene perfil — ir directo al flujo de partido
-        sessions[update.effective_chat.id] = {"draft": {}, "step": "waiting_input", "pending_field": None}
-        nivel = perfil.get("nivel_actual", "—")
-        partidos = perfil.get("partidos_total", 0)
-        await update.message.reply_text(
-            f"👋 Bienvenido de vuelta, {user.first_name}.\n\n"
-            f"📊 Nivel actual: *{nivel}* · Partidos registrados: *{partidos}*\n\n"
-            "Cuando termines un partido, cuéntame qué pasó — audio, texto, lo que quieras.\n\n"
-            "Comandos: /nuevo · /resumen · /historial · /minivel",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    else:
-        # Primera vez — lanzar evaluación inicial
-        sessions[update.effective_chat.id] = {
+    # ── Usuario ya autorizado ─────────────────────────────────────────────
+    if autorizado(user.id):
+        perfil = obtener_perfil(user.id)
+        if perfil:
+            sessions[chat_id] = {"draft": {}, "step": "waiting_input", "pending_field": None}
+            nivel    = perfil.get("nivel_actual", "—")
+            partidos = perfil.get("partidos_total", 0)
+            await update.message.reply_text(
+                f"👋 Bienvenido de vuelta, {user.first_name}.\n\n"
+                f"📊 Nivel actual: *{nivel}* · Partidos registrados: *{partidos}*\n\n"
+                "Cuando termines un partido, cuéntame qué pasó.\n\n"
+                "Comandos: /nuevo · /resumen · /historial · /minivel",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            # Autorizado pero sin perfil — lanzar evaluación inicial
+            sessions[chat_id] = {
+                "draft": {}, "step": "evaluacion",
+                "pending_field": None, "eval_idx": 0, "eval_data": {},
+            }
+            await update.message.reply_text(
+                f"🎾 ¡Hola {user.first_name}! Soy tu *Coach de Pádel*.\n\n"
+                "Antes de tu primer partido, necesito conocer tu nivel actual. "
+                "Voy a hacerte *9 preguntas rápidas* — elige la opción que mejor te describe.\n\n"
+                "Solo toma 2 minutos. 👇",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await enviar_pregunta_evaluacion(chat_id, context, 0)
+        return
+
+    # ── Usuario nuevo — verificar código de invitación ────────────────────
+    codigo_ingresado = args[0].strip() if args else ""
+
+    if codigo_ingresado == INVITE_CODE:
+        # Código correcto — autorizar y arrancar evaluación
+        try:
+            autorizar_usuario(user.id, user.username or str(user.id))
+        except Exception as e:
+            log.error(f"Error autorizando usuario: {e}")
+            await update.message.reply_text("❌ Error al registrarte. Intenta de nuevo en un momento.")
+            return
+
+        sessions[chat_id] = {
             "draft": {}, "step": "evaluacion",
-            "pending_field": None,
-            "eval_idx": 0,          # índice de la dimensión actual
-            "eval_data": {},        # respuestas del cuestionario
+            "pending_field": None, "eval_idx": 0, "eval_data": {},
         }
         await update.message.reply_text(
-            f"🎾 ¡Hola {user.first_name}! Soy tu *Coach de Pádel*.\n\n"
-            "Antes de tu primer partido, necesito conocer tu nivel actual. "
-            "Voy a hacerte *9 preguntas rápidas* — elige la opción que mejor te describe.\n\n"
-            "Esto me permite darte consejos y análisis adaptados exactamente a dónde estás. "
-            "Solo toma 2 minutos. 👇",
+            f"✅ ¡Código correcto! Bienvenido, {user.first_name}.\n\n"
+            f"🎾 Soy tu *Coach de Pádel*. Antes de tu primer partido necesito conocer tu nivel. "
+            f"Voy a hacerte *9 preguntas rápidas*.\n\nSolo toma 2 minutos. 👇",
             parse_mode=ParseMode.MARKDOWN
         )
-        await enviar_pregunta_evaluacion(update.effective_chat.id, context, 0)
+        await enviar_pregunta_evaluacion(chat_id, context, 0)
+
+    else:
+        # Sin código o código incorrecto
+        await update.message.reply_text(
+            "🔒 Este bot es privado.\n\n"
+            "Si tienes un código de acceso, úsalo así:\n"
+            "`/start TUCODIGO`",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 async def enviar_pregunta_evaluacion(chat_id: int, context: ContextTypes.DEFAULT_TYPE, idx: int):
     """Envía la pregunta de evaluación número idx."""
