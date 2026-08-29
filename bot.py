@@ -794,7 +794,8 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
     session = get_session(chat_id)
 
     # ── Esperando código de invitación ────────────────────────────────────
-    if session.get("step") == "waiting_invite":
+    # También aplica si no hay sesión (bot reiniciado) y el usuario no está autorizado
+    if session.get("step") == "waiting_invite" or (not autorizado(user_id) and session.get("step") in (None, "waiting_input")):
         codigo = texto.strip()
         if codigo == INVITE_CODE:
             try:
@@ -807,8 +808,6 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
                 "draft": {}, "step": "evaluacion",
                 "pending_field": None, "eval_idx": 0, "eval_data": {},
             }
-            user_obj = await context.bot.get_chat(chat_id)
-            nombre = getattr(user_obj, 'first_name', 'jugador')
             await context.bot.send_message(
                 chat_id,
                 f"✅ Acceso confirmado. Bienvenido.\n\n"
@@ -1159,11 +1158,24 @@ async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await enviar_analisis(update.effective_chat.id, context, analisis, draft)
 
 async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorizado(update.effective_user.id):
-        return
-    user = update.effective_user
+    user    = update.effective_user
+    chat_id = update.effective_chat.id
+    session = sessions.get(chat_id, {})
+
+    if not autorizado(user.id):
+        if session.get("step") == "waiting_invite":
+            # Tiene sesión esperando código — dejar pasar
+            pass
+        else:
+            # Usuario desconocido sin sesión activa — pedirle /start
+            await context.bot.send_message(
+                chat_id,
+                "Escribe /start para acceder al bot."
+            )
+            return
+
     await procesar_texto_libre(
-        update.effective_chat.id, user.id, user.username or str(user.id),
+        chat_id, user.id, user.username or str(user.id),
         update.message.text, context
     )
 
