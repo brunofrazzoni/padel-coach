@@ -854,6 +854,12 @@ async def cmd_minivel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autorizado(update.effective_user.id):
+        return
+    sessions[update.effective_chat.id] = {"draft": {}, "step": "waiting_input", "pending_field": None}
+    await update.message.reply_text("✅ Sesión reiniciada. Cuéntame del partido.")
+
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Verifica que el bot está vivo y que Supabase responde."""
     if not autorizado(update.effective_user.id):
