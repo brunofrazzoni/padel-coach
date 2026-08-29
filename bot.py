@@ -693,32 +693,58 @@ async def enviar_analisis(chat_id: int, context, a: dict, draft: dict):
 
 # ── FLUJO PRINCIPAL ───────────────────────────────────────────────────────────
 
+CAMPOS_MINIMOS = {"resultado", "nivel_rivales"}  # siempre obligatorios
+
 async def pedir_siguiente_campo(chat_id: int, context: ContextTypes.DEFAULT_TYPE, session: dict) -> bool:
     """
-    Busca el primer campo obligatorio sin completar y envía su teclado.
+    Con historial: solo pregunta resultado y nivel_rivales si faltan.
+    Sin historial: pregunta todos los campos de CAMPOS en orden.
     Retorna True si había algo pendiente, False si todo está completo.
     """
-    draft = session["draft"]
+    draft    = session["draft"]
+    hay_hist = bool(session.get("historial"))
+
+    # Determinar qué campos son obligatorios según contexto
+    campos_requeridos = CAMPOS_MINIMOS if hay_hist else set(CAMPOS.keys())
+
+    # Buscar primer campo faltante
     for campo, etiqueta in CAMPOS.items():
-        if draft.get(campo) is None:
-            session["pending_field"] = campo
-            session["step"] = "confirming"
-            if campo == "nivel_rivales":
-                kb = teclado_categorias(campo)
-            elif campo in ESCALAS_0_10:
-                kb = teclado_escala(campo)
-            else:
-                kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✏️ Escribir respuesta", callback_data=f"manual|{campo}")
-                ]])
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"❓ *{etiqueta}*",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb
-            )
-            return True
-    return False  # todos completos
+        if campo not in campos_requeridos:
+            continue
+        if draft.get(campo) is not None:
+            continue
+
+        session["pending_field"] = campo
+        session["step"] = "confirming"
+
+        if campo == "nivel_rivales":
+            kb = teclado_categorias(campo)
+        elif campo in ESCALAS_0_10:
+            kb = teclado_escala(campo)
+        else:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✏️ Escribir respuesta", callback_data=f"manual|{campo}")
+            ]])
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❓ *{etiqueta}*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb
+        )
+        return True
+
+    # Todos los campos requeridos están — si hay historial, rellenar faltantes con promedios
+    if hay_hist:
+        ctx = construir_contexto_historial(session["historial"])
+        for dim, promedio in ctx.items():
+            if dim == "nivel_rivales_habitual":
+                continue
+            if draft.get(dim) is None and dim in CAMPOS:
+                draft[dim] = promedio  # usar promedio histórico como fallback silencioso
+
+    return False  # listo para analizar
+
 
 async def mostrar_resumen_y_confirmar(chat_id: int, context: ContextTypes.DEFAULT_TYPE, session: dict):
     session["step"] = "ready"
