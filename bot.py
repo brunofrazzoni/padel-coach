@@ -27,7 +27,7 @@ claude    = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 groq      = Groq(api_key=os.environ["GROQ_API_KEY"])
 supabase  = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-INVITE_CODE  = os.environ.get("INVITE_CODE", "padel2024")  # código secreto de invitación
+INVITE_CODE  = os.environ.get("INVITE_CODE", "brunopadelcoach")  # código secreto de invitación
 ADMIN_IDS    = set(int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip())
 
 # Cache en memoria para evitar consultas a Supabase en cada mensaje
