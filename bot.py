@@ -27,7 +27,7 @@ claude    = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 groq      = Groq(api_key=os.environ["GROQ_API_KEY"])
 supabase  = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-INVITE_CODE  = os.environ.get("INVITE_CODE", "brunopadelcoach")  # código secreto de invitación
+INVITE_CODE  = os.environ.get("INVITE_CODE", "padel2024")  # código secreto de invitación
 ADMIN_IDS    = set(int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip())
 
 # Cache en memoria para evitar consultas a Supabase en cada mensaje
@@ -379,43 +379,110 @@ async def transcribir_audio(file_bytes: bytes, suffix: str = ".ogg") -> str:
 
 # ── EXTRACCIÓN CON CLAUDE ─────────────────────────────────────────────────────
 
-def extraer_datos_claude(texto: str, draft_actual: dict) -> dict:
+def construir_contexto_historial(historial: list) -> dict:
     """
-    Claude lee el texto del usuario y extrae todos los campos que pueda.
-    Devuelve un dict con los campos encontrados.
+    Calcula promedios y patrones del historial reciente.
+    Devuelve un dict con defaults inteligentes para usar como baseline.
+    """
+    if not historial:
+        return {}
+
+    dims = ["saque", "devolucion", "peloteo", "juego_red", "globo",
+            "posicionamiento", "uso_red", "construccion", "gestion_marcador",
+            "ansiedad", "foco", "gestion_errores", "comunicacion"]
+
+    promedios = {}
+    for dim in dims:
+        vals = []
+        for p in historial[:5]:
+            datos = p.get("datos_raw") or {}
+            if isinstance(datos, str):
+                try:
+                    datos = json.loads(datos)
+                except Exception:
+                    continue
+            if dim in datos and datos[dim] is not None:
+                try:
+                    vals.append(float(datos[dim]))
+                except Exception:
+                    pass
+        if vals:
+            promedios[dim] = round(sum(vals) / len(vals), 1)
+
+    # Nivel de rivales más frecuente
+    niveles_rivales = [p.get("nivel_rivales") for p in historial[:5] if p.get("nivel_rivales")]
+    if niveles_rivales:
+        promedios["nivel_rivales_habitual"] = max(set(niveles_rivales), key=niveles_rivales.count)
+
+    return promedios
+
+def extraer_datos_claude(texto: str, draft_actual: dict, historial: list = None) -> dict:
+    """
+    Claude lee el texto del usuario y extrae campos.
+    Con historial, puede inferir valores de frases como 'igual que siempre' o
+    'todo bien menos el saque' sin necesitar input explícito para cada campo.
     """
     campos_json = json.dumps({k: v for k, v in {**CAMPOS, **CAMPOS_OPCIONALES}.items()}, ensure_ascii=False, indent=2)
     draft_json  = json.dumps(draft_actual, ensure_ascii=False)
-
     categorias_validas = ", ".join(CATEGORIAS)
 
-    prompt = f"""Eres un asistente extrayendo datos de un reporte post-partido de pádel.
+    # Construir contexto de historial
+    historial = historial or []
+    ctx_hist  = construir_contexto_historial(historial)
+
+    if ctx_hist:
+        hist_txt = f"""
+HISTORIAL RECIENTE DEL JUGADOR (promedios de últimos {min(len(historial),5)} partidos):
+{json.dumps(ctx_hist, ensure_ascii=False, indent=2)}
+
+PARTIDOS ANTERIORES (para entender referencias como "igual que siempre" o "peor que el partido pasado"):
+""" + "\n".join(
+    f"- {str(p.get('fecha','?'))[:10]}: resultado={p.get('resultado','?')} "
+    f"rivales={p.get('nivel_rivales','?')} "
+    f"T={p.get('score_tecnica','?')} TÁC={p.get('score_tactica','?')} EM={p.get('score_emocional','?')}"
+    for p in historial[:3]
+)
+        reglas_hist = """
+REGLAS ESPECIALES CON HISTORIAL:
+- Si el usuario dice "igual que siempre", "como siempre", "normal", o similar → usa el promedio histórico para los campos no mencionados.
+- Si dice "todo bien menos X" → usa promedios históricos para todo excepto X, que lo marcas según lo que dijo.
+- Si dice "peor que el partido pasado" → baja ~2 puntos del promedio histórico para los campos relevantes.
+- Si dice "mejor que siempre" → sube ~1-2 puntos del promedio histórico.
+- Si menciona un campo específico con un valor claro, ese valor tiene prioridad absoluta sobre el historial.
+- Puedes inferir nivel_rivales del historial si el usuario dice "los mismos de siempre" o "rivales similares"."""
+    else:
+        hist_txt  = "\nPRIMER PARTIDO — sin historial disponible."
+        reglas_hist = ""
+
+    prompt = f"""Eres un asistente inteligente extrayendo datos de un reporte post-partido de pádel.
 
 CAMPOS QUE NECESITAS EXTRAER:
 {campos_json}
 
-DATOS YA RECOPILADOS (no los repitas):
+DATOS YA RECOPILADOS EN ESTA SESIÓN (no los repitas):
 {draft_json}
+{hist_txt}
 
 TEXTO DEL USUARIO:
 "{texto}"
 
-REGLAS DE EXTRACCIÓN:
-- Para campos numéricos 0-10: convierte "bien"→7, "regular"→5, "mal"→3, "muy bien"→8, "excelente"→9, "pésimo"→2, "bastante bien"→8, "no tan bien"→4.
-- Para "resultado": usa formato "X-Y / A-B" (ej. "6-4 / 3-6"). Si mencionan un solo set usa "X-Y".
-- Para "nivel_rivales": mapea a una de estas categorías chilenas exactas: {categorias_validas}. Interpreta "cuarta" como "4ta", "quinta alta" como "5ta alta", etc.
-- NUNCA extraigas "nivel_propio" — ese campo lo calcula el sistema, no el usuario.
-- Solo incluye campos que hayas podido extraer con confianza. No inventes valores.
+REGLAS DE EXTRACCIÓN BASE:
+- Campos numéricos 0-10: "bien"→7, "regular"→5, "mal"→3, "muy bien"→8, "excelente"→9, "pésimo"→2, "bastante bien"→8, "no tan bien"→4.
+- Para "resultado": formato "X-Y / A-B". Un set: "X-Y".
+- Para "nivel_rivales": mapea a categorías exactas: {categorias_validas}.
+- NUNCA extraigas "nivel_propio".
+- Solo incluye campos que puedas inferir con confianza (directamente o via historial).
+{reglas_hist}
 
-Responde SOLO con JSON.
-Ejemplo: {{"resultado": "6-4 / 3-6", "nivel_rivales": "4ta baja", "saque": 7, "ansiedad": 4}}"""
+Responde SOLO con JSON. Sin markdown.
+Ejemplo con historial: {{"resultado": "6-4 / 3-6", "saque": 6, "devolucion": 7, "peloteo": 5}}"""
 
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=500,
+        max_tokens=600,
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = resp.content[0].text.strip()
+    raw   = resp.content[0].text.strip()
     clean = re.sub(r"```json|```", "", raw).strip()
     try:
         return json.loads(clean)
@@ -668,6 +735,18 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
                                 texto: str, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(chat_id)
 
+    # Cargar historial una sola vez por sesión y guardarlo en memoria
+    if "historial" not in session:
+        session["historial"] = obtener_historial(user_id, limite=5)
+        if session["historial"]:
+            n = len(session["historial"])
+            await context.bot.send_message(
+                chat_id,
+                f"📚 _Cargué tu historial de {n} partido{'s' if n>1 else ''} anterior{'es' if n>1 else ''}. "
+                f"Puedes decirme cosas como \"igual que siempre\" o \"todo bien menos el saque\"._",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
     # Si estamos esperando un campo manual específico
     if session["step"] == "waiting_manual" and session.get("pending_field"):
         campo = session["pending_field"]
@@ -684,21 +763,24 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
         session["draft"][campo] = val
         session["pending_field"] = None
         session["step"] = "waiting_input"
-        await context.bot.send_message(chat_id, f"✅ Guardado.")
+        await context.bot.send_message(chat_id, "✅ Guardado.")
         faltan = await pedir_siguiente_campo(chat_id, context, session)
         if not faltan:
             await mostrar_resumen_y_confirmar(chat_id, context, session)
         return
 
-    # Extracción libre con Claude
+    # Extracción con historial como contexto
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    extraido = extraer_datos_claude(texto, session["draft"])
+    extraido = extraer_datos_claude(texto, session["draft"], session.get("historial", []))
 
     if extraido:
         session["draft"].update(extraido)
         campos_guardados = ", ".join(extraido.keys())
-        await context.bot.send_message(chat_id, f"✅ Entendido. Guardé: _{campos_guardados}_",
-                                       parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(
+            chat_id,
+            f"✅ Entendido. Guardé: _{campos_guardados}_",
+            parse_mode=ParseMode.MARKDOWN
+        )
     else:
         await context.bot.send_message(chat_id, "🤔 No pude extraer datos de eso. Intenta ser más específico.")
 
