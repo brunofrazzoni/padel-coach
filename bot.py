@@ -787,7 +787,14 @@ async def finalizar_evaluacion(chat_id: int, context: ContextTypes.DEFAULT_TYPE)
             f"Este es tu punto de partida. Con cada partido que registres, voy ajustando tu nivel "
             f"según tus resultados reales.\n\n"
             f"¡Listo! Cuando termines un partido, cuéntame qué pasó. "
-            f"Puedes mandarme un audio, escribir o mezclar los dos. 🎾"
+            f"Puedes mandarme un audio, escribir o mezclar los dos. 🎾\n\n"
+            f"─────────────────────\n"
+            f"*Comandos disponibles:*\n"
+            f"/nuevo — registrar un partido nuevo\n"
+            f"/resumen — ver el análisis de tu último partido\n"
+            f"/historial — tus últimos 5 partidos con scores\n"
+            f"/minivel — tu nivel actual y progreso\n"
+            f"/borrar — borrar la sesión en curso"
         ),
         parse_mode=ParseMode.MARKDOWN
     )
