@@ -793,6 +793,34 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
                                 texto: str, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(chat_id)
 
+    # ── Esperando código de invitación ────────────────────────────────────
+    if session.get("step") == "waiting_invite":
+        codigo = texto.strip()
+        if codigo == INVITE_CODE:
+            try:
+                autorizar_usuario(user_id, username)
+            except Exception as e:
+                log.error(f"Error autorizando usuario: {e}")
+                await context.bot.send_message(chat_id, "❌ Error al registrarte. Intenta de nuevo.")
+                return
+            sessions[chat_id] = {
+                "draft": {}, "step": "evaluacion",
+                "pending_field": None, "eval_idx": 0, "eval_data": {},
+            }
+            user_obj = await context.bot.get_chat(chat_id)
+            nombre = getattr(user_obj, 'first_name', 'jugador')
+            await context.bot.send_message(
+                chat_id,
+                f"✅ Acceso confirmado. Bienvenido.\n\n"
+                f"Soy tu *Coach de Pádel*. Antes de tu primer partido necesito conocer tu nivel. "
+                f"Voy a hacerte *9 preguntas rápidas*.\n\nSolo toma 2 minutos. 👇",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await enviar_pregunta_evaluacion(chat_id, context, 0)
+        else:
+            await context.bot.send_message(chat_id, "❌ Código incorrecto. Intenta de nuevo:")
+        return
+
     # Si estamos esperando un campo manual específico
     if session["step"] == "waiting_manual" and session.get("pending_field"):
         campo = session["pending_field"]
@@ -881,8 +909,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await enviar_pregunta_evaluacion(chat_id, context, 0)
         return
 
-    # ── Usuario nuevo — verificar código de invitación ────────────────────
+    # ── Usuario nuevo — pedir código de invitación ────────────────────────
+    # Verificar si ya nos dieron el código en args (deep link) o en sesión previa
     codigo_ingresado = args[0].strip() if args else ""
+
+    # Si no vino por deep link, revisar si ya lo tenemos en sesión
+    if not codigo_ingresado:
+        session = sessions.get(chat_id, {})
+        codigo_ingresado = session.get("codigo_pendiente", "")
 
     if codigo_ingresado == INVITE_CODE:
         # Código correcto — autorizar y arrancar evaluación
@@ -898,20 +932,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "pending_field": None, "eval_idx": 0, "eval_data": {},
         }
         await update.message.reply_text(
-            f"✅ ¡Código correcto! Bienvenido, {user.first_name}.\n\n"
-            f"🎾 Soy tu *Coach de Pádel*. Antes de tu primer partido necesito conocer tu nivel. "
+            f"✅ Acceso confirmado. Bienvenido, {user.first_name}.\n\n"
+            f"Soy tu *Coach de Pádel*. Antes de tu primer partido necesito conocer tu nivel. "
             f"Voy a hacerte *9 preguntas rápidas*.\n\nSolo toma 2 minutos. 👇",
             parse_mode=ParseMode.MARKDOWN
         )
         await enviar_pregunta_evaluacion(chat_id, context, 0)
 
     else:
-        # Sin código o código incorrecto
+        # Sin código válido — pedir que lo escriba
+        sessions[chat_id] = {"draft": {}, "step": "waiting_invite", "pending_field": None}
         await update.message.reply_text(
             "🔒 Este bot es privado.\n\n"
-            "Si tienes un código de acceso, úsalo así:\n"
-            "`/start TUCODIGO`",
-            parse_mode=ParseMode.MARKDOWN
+            "Escribe tu código de acceso para continuar:"
         )
 
 async def enviar_pregunta_evaluacion(chat_id: int, context: ContextTypes.DEFAULT_TYPE, idx: int):
@@ -1315,4 +1348,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
