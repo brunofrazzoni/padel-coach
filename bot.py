@@ -547,53 +547,58 @@ Responde SOLO con el nombre exacto de la categoría. Sin explicación."""
 
 # ── FORMATO DE ANÁLISIS PARA TELEGRAM ────────────────────────────────────────
 
-def formatear_analisis(a: dict, draft: dict) -> str:
-    st = a.get("score_tecnica", 0)
-    sa = a.get("score_tactica", 0)
-    se = a.get("score_emocional", 0)
+def formatear_analisis(a: dict, draft: dict) -> list[str]:
+    """Devuelve el análisis dividido en 4 mensajes para no superar el límite de 4096 chars de Telegram."""
+    st    = a.get("score_tecnica", 0)
+    sa    = a.get("score_tactica", 0)
+    se    = a.get("score_emocional", 0)
     nivel = a.get("nivel_inferido", "—")
 
     def emoji_score(s):
         return "🟢" if s >= 7 else "🟡" if s >= 4.5 else "🔴"
 
-    return f"""{a.get('emoji_partido','🎾')} *Resultado: {draft.get('resultado','—')}*
-Tu nivel: *{nivel}* · Rivales: {draft.get('nivel_rivales','—')}
+    msg1 = (
+        f"{a.get('emoji_partido','🎾')} *Resultado: {draft.get('resultado','—')}*\n"
+        f"Tu nivel: *{nivel}* · Rivales: {draft.get('nivel_rivales','—')}\n\n"
+        f"{emoji_score(st)} Técnica: *{st}/10* · "
+        f"{emoji_score(sa)} Táctica: *{sa}/10* · "
+        f"{emoji_score(se)} Emocional: *{se}/10*\n\n"
+        f"─────────────────────\n"
+        f"📋 *RESUMEN*\n"
+        f"{a.get('resumen','')}"
+    )
 
-{emoji_score(st)} Técnica: *{st}/10* · {emoji_score(sa)} Táctica: *{sa}/10* · {emoji_score(se)} Emocional: *{se}/10*
+    msg2 = (
+        f"🎉 *LO QUE HICISTE BIEN*\n\n"
+        f"⚡ *Técnica*\n{a.get('celebracion_tecnica','')}\n\n"
+        f"🧠 *Táctica*\n{a.get('celebracion_tactica','')}\n\n"
+        f"💚 *Emocional*\n{a.get('celebracion_emocional','')}"
+    )
 
-─────────────────────
-📋 *RESUMEN*
-{a.get('resumen','')}
+    msg3 = (
+        f"🔧 *CÓMO MEJORAR ESTA SEMANA*\n\n"
+        f"🎾 *Técnica*\n{a.get('consejo_tecnico','')}\n\n"
+        f"🧩 *Táctica*\n{a.get('consejo_tactico','')}\n\n"
+        f"🧘 *Emocional*\n{a.get('consejo_emocional','')}"
+    )
 
-─────────────────────
-🎉 *LO QUE HICISTE BIEN*
+    msg4 = (
+        f"🎯 *PRIORIDAD #1 ESTA SEMANA*\n"
+        f"_{a.get('prioridad_semana','')}_\n\n"
+        f"─────────────────────\n"
+        f"📊 *PATRÓN DETECTADO*\n"
+        f"{a.get('patron_detectado','')}\n\n"
+        f"─────────────────────\n"
+        f"📈 *TU NIVEL ACTUAL: {nivel}*\n"
+        f"{a.get('mensaje_nivel','')}"
+    )
 
-⚡ Técnica: {a.get('celebracion_tecnica','')}
+    return [msg1, msg2, msg3, msg4]
 
-🧠 Táctica: {a.get('celebracion_tactica','')}
-
-💚 Emocional: {a.get('celebracion_emocional','')}
-
-─────────────────────
-🔧 *CÓMO MEJORAR*
-
-🎾 Técnica: {a.get('consejo_tecnico','')}
-
-🧩 Táctica: {a.get('consejo_tactico','')}
-
-🧘 Emocional: {a.get('consejo_emocional','')}
-
-─────────────────────
-🎯 *PRIORIDAD #1 ESTA SEMANA*
-_{a.get('prioridad_semana','')}_
-
-─────────────────────
-📊 *PATRÓN DETECTADO*
-{a.get('patron_detectado','')}
-
-─────────────────────
-📈 *TU NIVEL ACTUAL: {nivel}*
-{a.get('mensaje_nivel','')}"""
+async def enviar_analisis(chat_id: int, context, a: dict, draft: dict):
+    """Envía el análisis en mensajes separados para evitar el límite de 4096 chars."""
+    for msg in formatear_analisis(a, draft):
+        await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN)
 
 # ── FLUJO PRINCIPAL ───────────────────────────────────────────────────────────
 
@@ -769,8 +774,11 @@ async def finalizar_evaluacion(chat_id: int, context: ContextTypes.DEFAULT_TYPE)
             eval_data=eval_data,
             nivel_inicial=nivel_inicial,
         )
+        log.info(f"Perfil guardado para user_id={user_data.get('id')} nivel={nivel_inicial}")
     except Exception as e:
         log.error(f"Error guardando perfil: {e}")
+        await context.bot.send_message(chat_id, f"⚠️ No se pudo guardar tu perfil en la base de datos.\nError: `{e}`\n\nIntenta /start de nuevo.", parse_mode=ParseMode.MARKDOWN)
+        return
 
     # Descripción de ese nivel
     desc = CATEGORIAS_DESC.get(nivel_inicial, "")
@@ -846,7 +854,23 @@ async def cmd_minivel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Verifica que el bot está vivo y que Supabase responde."""
+    if not autorizado(update.effective_user.id):
+        return
+    # Test Supabase
+    try:
+        supabase.table("jugadores").select("user_id").limit(1).execute()
+        db_status = "✅ Supabase conectado"
+    except Exception as e:
+        db_status = f"❌ Supabase error: `{e}`"
+
+    await update.message.reply_text(
+        f"🟢 Bot activo.\n{db_status}",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
     if not autorizado(update.effective_user.id):
         return
     sessions[update.effective_chat.id] = {"draft": {}, "step": "waiting_input", "pending_field": None}
@@ -886,10 +910,7 @@ async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p = partidos[0]
     analisis = json.loads(p.get("analisis_raw","{}"))
     draft    = json.loads(p.get("datos_raw","{}"))
-    await update.message.reply_text(
-        formatear_analisis(analisis, draft),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await enviar_analisis(update.effective_chat.id, context, analisis, draft)
 
 async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not autorizado(update.effective_user.id):
@@ -1024,9 +1045,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 3. Guardar partido
         try:
             guardar_partido(user.id, user.username or str(user.id), draft, analysis, nivel_inferido)
+            await context.bot.send_message(chat_id, "💾 _Partido guardado en base de datos._", parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             log.error(f"Error Supabase partidos: {e}")
-            await context.bot.send_message(chat_id, "⚠️ Análisis listo pero no pude guardar el partido.")
+            await context.bot.send_message(chat_id, f"⚠️ Análisis listo pero *no se guardó* en la base de datos.\nError: `{e}`", parse_mode=ParseMode.MARKDOWN)
 
         # 4. Actualizar nivel en perfil del jugador
         try:
@@ -1035,7 +1057,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.error(f"Error actualizando perfil: {e}")
 
         texto = formatear_analisis(analysis, draft)
-        await context.bot.send_message(chat_id, texto, parse_mode=ParseMode.MARKDOWN)
+        await enviar_analisis(chat_id, context, analysis, draft)
 
         # Preguntas opcionales
         await context.bot.send_message(
@@ -1062,6 +1084,7 @@ def main():
     app   = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("ping",      cmd_ping))
     app.add_handler(CommandHandler("nuevo",     cmd_nuevo))
     app.add_handler(CommandHandler("borrar",    cmd_borrar))
     app.add_handler(CommandHandler("historial", cmd_historial))
