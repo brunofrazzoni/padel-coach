@@ -1741,27 +1741,26 @@ async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     texto   = update.message.text
     session = sessions.get(chat_id, {})
+    step    = session.get("step", "")
 
-    # ── Paso 1: ¿Está esperando código de invitación? ────────────────────
-    if session.get("step") == "waiting_invite":
+    # ── Paso 1: En medio del onboarding — dejar pasar siempre ────────────
+    ONBOARDING_STEPS = {"evaluacion", "waiting_nombre", "waiting_username", "waiting_invite"}
+    if step in ONBOARDING_STEPS:
         await procesar_texto_libre(chat_id, user.id, user.username or str(user.id), texto, context)
         return
 
     # ── Paso 2: ¿Está autorizado? ─────────────────────────────────────────
     if not autorizado(user.id):
-        # Cualquier mensaje de usuario desconocido → pedir código
         sessions[chat_id] = {"draft": {}, "step": "waiting_invite", "pending_field": None}
         await context.bot.send_message(
             chat_id,
-            "👋 Hola. Este bot es privado.\n\n"
-            "Si tienes un código de acceso, escríbelo acá:"
+            "👋 Hola. Este bot es privado.\n\nSi tienes un código de acceso, escríbelo acá:"
         )
         return
 
     # ── Paso 3: Autorizado — ¿tiene perfil? ──────────────────────────────
     perfil = obtener_perfil(user.id)
     if not perfil:
-        # Autorizado pero sin perfil → onboarding
         await iniciar_onboarding(chat_id, user, context)
         return
 
