@@ -898,7 +898,69 @@ def detectar_intent(texto: str) -> str:
     for kw in ayuda_kw:
         if kw in t: return "ayuda"
 
+    # Consultas técnicas / táctica
+    consulta_kw = ["qué es", "que es", "cómo se hace", "como se hace", "cómo ejecuto",
+                   "como ejecuto", "explícame", "explicame", "enséñame", "ensenme",
+                   "cómo mejoro", "como mejoro", "técnica de", "tecnica de",
+                   "qué es la", "que es la", "qué es el", "que es el",
+                   "cómo se juega", "como se juega", "tips de", "consejo sobre",
+                   "háblame de", "hablame de", "información sobre", "informacion sobre"]
+    for kw in consulta_kw:
+        if t.startswith(kw) or kw in t: return "consulta_tecnica"
+
+    # Nombres directos de golpes también disparan consulta
+    golpes_kw = ["bandeja", "víbora", "vibora", "volea", "globo", "smash", "remate",
+                 "chiquita", "volcada", "bajada de pared", "contra pared", "bote pronto",
+                 "dormilona", "salida de pared", "derecha", "revés", "reves", "saque",
+                 "servicio", "resto"]
+    for kw in golpes_kw:
+        if t == kw or t == f"la {kw}" or t == f"el {kw}":
+            return "consulta_tecnica"
+
     return "partido"
+
+async def responder_consulta_tecnica(chat_id: int, user_id: int, texto: str,
+                                      context: ContextTypes.DEFAULT_TYPE):
+    """Responde preguntas técnicas/tácticas buscando en la base de conocimiento."""
+    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    # Obtener nivel del jugador para contextualizar
+    perfil = obtener_perfil(user_id)
+    nivel  = perfil.get("nivel_actual", "5ta alta") if perfil else "5ta alta"
+
+    # Buscar en la base de conocimiento
+    conocimiento = buscar_conocimiento(texto, nivel, limite=3)
+
+    if not conocimiento:
+        await context.bot.send_message(
+            chat_id,
+            "🤔 No encontré información sobre eso en mi base de conocimiento aún. "
+            "La base se va ampliando — prueba con otro golpe o término.",
+        )
+        return
+
+    # Usar Claude para dar una respuesta natural usando el conocimiento encontrado
+    prompt = f"""Eres un coach de pádel respondiendo una pregunta de un jugador de nivel {nivel}.
+
+PREGUNTA DEL JUGADOR: "{texto}"
+
+INFORMACIÓN TÉCNICA DISPONIBLE:
+{conocimiento}
+
+Responde de forma directa y útil para su nivel. Máximo 3-4 párrafos cortos.
+- Si hay una frase clave de coach, úsala literalmente.
+- Si hay un link de referencia, inclúyelo al final como "🎥 Ver referencia: [url]".
+- No inventes información que no esté en los datos técnicos provistos.
+- Tono cercano, como un coach que conoce al jugador."""
+
+    resp = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=600,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    respuesta = resp.content[0].text.strip()
+
+    await context.bot.send_message(chat_id, respuesta, parse_mode=ParseMode.MARKDOWN)
 
 async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
                                 texto: str, context: ContextTypes.DEFAULT_TYPE):
@@ -973,6 +1035,9 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
                 f"• _\"último análisis\"_ — resumen anterior",
                 parse_mode=ParseMode.MARKDOWN
             )
+            return
+        elif intent == "consulta_tecnica":
+            await responder_consulta_tecnica(chat_id, user_id, texto, context)
             return
         elif intent == "historial":
             await cmd_historial_chat(chat_id, user_id, context)
@@ -1594,4 +1659,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
