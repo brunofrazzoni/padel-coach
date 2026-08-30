@@ -1265,7 +1265,65 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
             return
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    # Normalizar step
+    step_actual = session.get("step") or "waiting_input"
+    log.info(f"step_actual='{step_actual}' ejecutando intent/extracción")
+
+    # Detectar intent si estamos listos para recibir partido
+    if step_actual == "waiting_input":
+        intent = detectar_intent(texto)
+        log.info(f"intent='{intent}'")
+
+        if intent == "saludo":
+            perfil   = obtener_perfil(user_id)
+            nivel    = (perfil or {}).get("nivel_actual", "—")
+            partidos = (perfil or {}).get("partidos_total", 0)
+            hist_tip = " Puedes decirme cosas como _\"igual que siempre pero con más errores en la red\"_." if partidos > 0 else ""
+            await context.bot.send_message(
+                chat_id,
+                f"👋 ¡Hola! Soy tu coach de pádel.\n\n"
+                f"📊 Nivel actual: *{nivel}* · Partidos registrados: *{partidos}*\n\n"
+                f"Cuando termines un partido cuéntame cómo les fue.{hist_tip}\n\n"
+                f"También puedes preguntarme:\n"
+                f"• _\"cómo voy\"_ · _\"mis partidos\"_ · _\"último análisis\"_",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        elif intent == "consulta_tecnica":
+            await responder_consulta_tecnica(chat_id, user_id, texto, context)
+            return
+        elif intent == "historial":
+            await cmd_historial_chat(chat_id, user_id, context)
+            return
+        elif intent == "minivel":
+            await cmd_minivel_chat(chat_id, user_id, context)
+            return
+        elif intent == "resumen":
+            await cmd_resumen_chat(chat_id, user_id, context)
+            return
+        elif intent == "nuevo":
+            historial = obtener_historial(user_id, limite=5)
+            sessions[chat_id] = {"draft": {}, "step": "waiting_input", "pending_field": None, "historial": historial}
+            await context.bot.send_message(chat_id, "✅ Listo. Cuéntame del partido.")
+            return
+        elif intent == "ayuda":
+            await context.bot.send_message(
+                chat_id,
+                "🎾 *Puedo ayudarte con:*\n\n"
+                "• Contarme de un partido (audio o texto)\n"
+                "• _\"cómo voy\"_ — tu nivel y progreso\n"
+                "• _\"mis partidos\"_ — historial\n"
+                "• _\"último análisis\"_ — resumen del partido anterior\n"
+                "• _\"nuevo partido\"_ — empezar registro",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        # intent == "partido" — continúa a extracción
+
+    # Extracción de datos del partido
     extraido = extraer_datos_claude(texto, session["draft"], session.get("historial", []))
+    log.info(f"extraido keys={list(extraido.keys()) if extraido else 'vacío'}")
 
     if extraido:
         session["draft"].update(extraido)
@@ -1282,10 +1340,7 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
             "Cuéntame cómo les fue — por ejemplo:\n"
             "_\"Ganamos 6-4 6-2 contra rivales de 4ta, el saque estuvo bien pero cometimos errores en la red\"_\n\n"
             "O si quieres hacer otra cosa:\n"
-            "• _\"cómo voy\"_ — tu nivel y progreso\n"
-            "• _\"mis partidos\"_ — historial\n"
-            "• _\"último análisis\"_ — resumen anterior\n"
-            "• _\"ayuda\"_ — ver todas las opciones",
+            "• _\"cómo voy\"_ · _\"mis partidos\"_ · _\"último análisis\"_ · _\"ayuda\"_",
             parse_mode=ParseMode.MARKDOWN
         )
 
