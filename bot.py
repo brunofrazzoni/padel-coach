@@ -1743,6 +1743,8 @@ async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = sessions.get(chat_id, {})
     step    = session.get("step", "")
 
+    log.info(f"handle_texto user={user.id} step='{step}' autorizado={autorizado(user.id)} texto='{texto[:40]}'")
+
     # ── Paso 1: En medio del onboarding — dejar pasar siempre ────────────
     ONBOARDING_STEPS = {"evaluacion", "waiting_nombre", "waiting_username", "waiting_invite"}
     if step in ONBOARDING_STEPS:
@@ -1765,6 +1767,7 @@ async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Paso 4: Usuario completo — procesar normalmente ───────────────────
+    log.info(f"handle_texto → procesar_texto_libre user={user.id} step='{step}'")
     await procesar_texto_libre(chat_id, user.id, user.username or str(user.id), texto, context)
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
