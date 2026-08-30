@@ -1379,11 +1379,10 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
 
     if extraido:
         session["draft"].update(extraido)
-        campos_guardados = ", ".join(extraido.keys())
+        campos_guardados = ", ".join(extraido.keys()).replace("_", " ")
         await context.bot.send_message(
             chat_id,
-            f"✅ Entendido. Guardé: _{campos_guardados}_",
-            parse_mode=ParseMode.MARKDOWN
+            f"✅ Entendido. Guardé: {campos_guardados}",
         )
     else:
         await context.bot.send_message(
