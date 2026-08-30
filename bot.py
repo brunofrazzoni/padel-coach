@@ -942,6 +942,58 @@ async def mostrar_resumen_y_confirmar(chat_id: int, context: ContextTypes.DEFAUL
         reply_markup=teclado_confirmacion_final()
     )
 
+def detectar_intent(texto: str) -> str:
+    """Detecta si el usuario está pidiendo algo del sistema o reportando un partido."""
+    t = texto.lower().strip()
+
+    saludos = ["hola", "buenas", "buen día", "buen dia", "buenos días", "buenos dias",
+               "buenas tardes", "buenas noches", "hey", "hi", "hello",
+               "qué tal", "que tal", "cómo estás", "como estas", "cómo está",
+               "como esta", "cómo te va", "como te va"]
+    for kw in saludos:
+        if t == kw or t.startswith(kw + " ") or t.startswith(kw + "!") or t.startswith(kw + ","):
+            return "saludo"
+
+    historial_kw = ["historial", "partidos anteriores", "mis partidos", "cuántos partidos",
+                    "cuantos partidos", "últimos partidos", "ultimos partidos"]
+    nivel_kw     = ["mi nivel", "cómo voy", "como voy", "qué nivel", "que nivel",
+                    "mi progreso", "progreso", "cuánto he mejorado", "cuanto he mejorado",
+                    "en qué categoría", "en que categoria"]
+    resumen_kw   = ["último análisis", "ultimo analisis", "último partido", "ultimo partido",
+                    "qué fue lo último", "que fue lo ultimo", "lo que trabajamos",
+                    "resumen", "mi análisis", "mi analisis"]
+    nuevo_kw     = ["nuevo partido", "registrar partido", "quiero registrar",
+                    "empezar partido", "partido nuevo", "agregar partido"]
+    ayuda_kw     = ["ayuda", "comandos", "qué puedes hacer", "que puedes hacer",
+                    "cómo funciona", "como funciona", "qué haces", "que haces",
+                    "instrucciones", "para qué sirves", "para que sirves"]
+    consulta_kw  = ["qué es", "que es", "cómo se hace", "como se hace",
+                    "cómo ejecuto", "como ejecuto", "explícame", "explicame",
+                    "cómo mejoro", "como mejoro", "técnica de", "tecnica de",
+                    "cómo se juega", "como se juega", "tips de", "consejo sobre",
+                    "háblame de", "hablame de"]
+    golpes_kw    = ["bandeja", "víbora", "vibora", "volea", "globo", "smash", "remate",
+                    "chiquita", "volcada", "bajada de pared", "contrapared", "bote pronto",
+                    "dormilona", "salida de pared", "revés", "reves", "saque", "servicio"]
+
+    for kw in historial_kw:
+        if kw in t: return "historial"
+    for kw in nivel_kw:
+        if kw in t: return "minivel"
+    for kw in resumen_kw:
+        if kw in t: return "resumen"
+    for kw in nuevo_kw:
+        if kw in t: return "nuevo"
+    for kw in ayuda_kw:
+        if kw in t: return "ayuda"
+    for kw in consulta_kw:
+        if kw in t: return "consulta_tecnica"
+    for kw in golpes_kw:
+        if t == kw or t == f"la {kw}" or t == f"el {kw}":
+            return "consulta_tecnica"
+
+    return "partido"
+
 def detectar_partner_en_texto(texto: str) -> str | None:
     """Extrae mención de pareja del texto del usuario."""
     import re
