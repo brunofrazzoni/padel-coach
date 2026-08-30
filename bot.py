@@ -244,19 +244,43 @@ def obtener_perfil(user_id: int) -> dict | None:
         log.error(f"Error obteniendo perfil: {e}")
         return None
 
-def guardar_perfil(user_id: int, username: str, eval_data: dict, nivel_inicial: str) -> None:
+def guardar_perfil(user_id: int, username: str, eval_data: dict, nivel_inicial: str,
+                   nombre: str = "", telegram_username: str = "") -> None:
     """Crea o actualiza el perfil del jugador con su evaluación inicial."""
     row = {
-        "user_id":        str(user_id),
-        "username":       username,
-        "nivel_inicial":  nivel_inicial,
-        "nivel_actual":   nivel_inicial,
-        "eval_inicial":   json.dumps(eval_data, ensure_ascii=False),
-        "fecha_eval":     datetime.utcnow().isoformat(),
-        "partidos_total": 0,
+        "user_id":            str(user_id),
+        "username":           username,
+        "nombre":             nombre,
+        "telegram_username":  telegram_username.lstrip("@").lower(),
+        "nivel_inicial":      nivel_inicial,
+        "nivel_actual":       nivel_inicial,
+        "eval_inicial":       json.dumps(eval_data, ensure_ascii=False),
+        "fecha_eval":         datetime.utcnow().isoformat(),
+        "partidos_total":     0,
     }
-    # Upsert — crea si no existe, actualiza si ya existe
     supabase.table("jugadores").upsert(row, on_conflict="user_id").execute()
+
+def buscar_jugador_por_nombre_o_username(query: str) -> dict | None:
+    """Busca un jugador en la base por nombre o username de Telegram."""
+    query_clean = query.lstrip("@").lower().strip()
+    try:
+        # Buscar por telegram_username exacto
+        resp = (supabase.table("jugadores")
+                .select("user_id,nombre,telegram_username,nivel_actual")
+                .eq("telegram_username", query_clean)
+                .limit(1).execute())
+        if resp.data:
+            return resp.data[0]
+        # Buscar por nombre (ilike — case insensitive, parcial)
+        resp2 = (supabase.table("jugadores")
+                 .select("user_id,nombre,telegram_username,nivel_actual")
+                 .ilike("nombre", f"%{query}%")
+                 .limit(1).execute())
+        if resp2.data:
+            return resp2.data[0]
+    except Exception as e:
+        log.error(f"Error buscando jugador: {e}")
+    return None
 
 def actualizar_nivel_jugador(user_id: int, nuevo_nivel: str) -> None:
     """Actualiza el nivel actual del jugador después de cada partido."""
@@ -858,7 +882,55 @@ async def mostrar_resumen_y_confirmar(chat_id: int, context: ContextTypes.DEFAUL
         reply_markup=teclado_confirmacion_final()
     )
 
-def detectar_intent(texto: str) -> str:
+def detectar_partner_en_texto(texto: str) -> str | None:
+    """Extrae mención de pareja del texto del usuario."""
+    import re
+    # Buscar @username
+    match = re.search(r'@([A-Za-z0-9_]{3,})', texto)
+    if match:
+        return "@" + match.group(1)
+    # Buscar patrones como "jugué con Bruno", "mi dupla es Frazzoni"
+    patrones = [
+        r'(?:jugué|juqué|jug[ue]amos|mi dupla|mi pareja|con)\s+(?:con\s+)?([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)?)',
+    ]
+    for pat in patrones:
+        m = re.search(pat, texto)
+        if m:
+            return m.group(1).strip()
+    return None
+
+async def notificar_partner(partner: dict, draft: dict, analysis: dict,
+                             remitente_nombre: str, context: ContextTypes.DEFAULT_TYPE):
+    """Manda mensaje al partner para que registre su percepción del mismo partido."""
+    partner_user_id = partner.get("user_id")
+    if not partner_user_id:
+        return
+
+    # Datos fijos del partido que no cambian
+    resultado     = draft.get("resultado", "—")
+    nivel_rivales = draft.get("nivel_rivales", "—")
+
+    try:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎾 Registrar mi percepción", callback_data=f"partner_partido|{resultado}|{nivel_rivales}"),
+            InlineKeyboardButton("❌ No fui yo", callback_data="partner_no"),
+        ]])
+        await context.bot.send_message(
+            chat_id=int(partner_user_id),
+            text=(
+                f"🎾 *{remitente_nombre}* acaba de registrar un partido y dice que jugaste con él/ella.\n\n"
+                f"📊 Resultado: *{resultado}*\n"
+                f"👥 Rivales: *{nivel_rivales}*\n\n"
+                f"¿Quieres registrar tu percepción del partido? "
+                f"El resultado y el nivel de rivales ya están cargados — solo necesito tu evaluación personal."
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb
+        )
+    except Exception as e:
+        log.error(f"Error notificando partner {partner_user_id}: {e}")
+
+
     """
     Detecta si el usuario está pidiendo una acción del sistema,
     haciendo conversación, o reportando un partido.
@@ -966,6 +1038,62 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
                                 texto: str, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(chat_id)
 
+    # ── Recolección de nombre ────────────────────────────────────────────────
+    if session.get("step") == "waiting_nombre":
+        nombre = texto.strip()
+        if len(nombre.split()) < 2:
+            await context.bot.send_message(chat_id,
+                "Por favor escribe tu nombre y apellido completos (ej: _Bruno Frazzoni_).",
+                parse_mode=ParseMode.MARKDOWN)
+            return
+        session["nombre_pendiente"] = nombre
+        session["step"] = "waiting_username"
+
+        # Detectar si Telegram ya nos dio el username
+        tg_username = f"@{username}" if username and not username.isdigit() else None
+
+        if tg_username:
+            # Ya tiene username — confirmarlo
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"✅ Sí, mi @ es {tg_username}", callback_data=f"set_username|{tg_username}"),
+                InlineKeyboardButton("✏️ Usar otro", callback_data="set_username|manual"),
+            ]])
+            await context.bot.send_message(
+                chat_id,
+                f"Perfecto, *{nombre}* 👋\n\n"
+                f"Veo que tu usuario de Telegram es *{tg_username}*. ¿Es correcto?",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb
+            )
+        else:
+            # No tiene username — enseñarle a crearlo
+            await context.bot.send_message(
+                chat_id,
+                f"Perfecto, *{nombre}* 👋\n\n"
+                f"Para que tus compañeros de juego puedan encontrarte, necesitas tener un *username de Telegram*.\n\n"
+                f"Si no tienes uno, créalo así:\n"
+                f"1. Abre Telegram → *Ajustes*\n"
+                f"2. Toca tu nombre → *Nombre de usuario*\n"
+                f"3. Elige un @username único\n\n"
+                f"Cuando lo tengas, escríbelo acá (ej: _@brunof_):",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        return
+
+    # ── Recolección de username manual ───────────────────────────────────────
+    if session.get("step") == "waiting_username":
+        raw = texto.strip()
+        if not raw.startswith("@"):
+            raw = "@" + raw
+        if len(raw) < 4 or " " in raw:
+            await context.bot.send_message(chat_id,
+                "El username debe empezar con @ y no tener espacios. Ej: _@brunof_",
+                parse_mode=ParseMode.MARKDOWN)
+            return
+        nombre = session.get("nombre_pendiente", "")
+        await guardar_perfil_y_continuar(chat_id, context, nombre, raw)
+        return
+
     # ── Esperando código de invitación ────────────────────────────────────
     # También aplica si no hay sesión (bot reiniciado) y el usuario no está autorizado
     if session.get("step") == "waiting_invite" or (not autorizado(user_id) and session.get("step") in (None, "waiting_input")):
@@ -1014,6 +1142,10 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
         if not faltan:
             await mostrar_resumen_y_confirmar(chat_id, context, session)
         return
+
+    # Guardar texto original para detección de partner al final
+    if not session.get("texto_original"):
+        session["texto_original"] = texto
 
     # Extracción con historial como contexto
     # Pero primero — detectar si el usuario está pidiendo algo del sistema
@@ -1102,16 +1234,33 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
 
 # ── HANDLERS DE TELEGRAM ──────────────────────────────────────────────────────
 
+async def iniciar_onboarding(chat_id: int, user, context, msg: str = ""):
+    """Arranca onboarding completo: evaluación + nombre + username."""
+    sessions[chat_id] = {
+        "draft": {}, "step": "evaluacion",
+        "pending_field": None, "eval_idx": 0, "eval_data": {},
+        "_user": {"id": user.id, "username": user.username or str(user.id)},
+    }
+    texto = msg or (
+        f"🎾 ¡Hola {user.first_name}! Soy tu *Coach de Pádel*.\n\n"
+        "Antes de tu primer partido necesito conocer tu nivel. "
+        "Voy a hacerte *9 preguntas rápidas* — elige la opción que mejor te describe.\n\n"
+        "Solo toma 2 minutos. 👇"
+    )
+    await context.bot.send_message(chat_id, texto, parse_mode=ParseMode.MARKDOWN)
+    await enviar_pregunta_evaluacion(chat_id, context, 0)
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user     = update.effective_user
-    chat_id  = update.effective_chat.id
-    args     = context.args  # texto después de /start
+    user    = update.effective_user
+    chat_id = update.effective_chat.id
+    args    = context.args
 
     # ── Usuario ya autorizado ─────────────────────────────────────────────
     if autorizado(user.id):
         perfil = obtener_perfil(user.id)
         if perfil:
             historial = obtener_historial(user.id, limite=5)
+            nombre    = perfil.get("nombre") or user.first_name or ""
             sessions[chat_id] = {
                 "draft": {}, "step": "waiting_input",
                 "pending_field": None, "historial": historial,
@@ -1121,63 +1270,45 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hist_msg = ""
             if historial:
                 n = len(historial)
-                hist_msg = (f"\n📚 _Cargué tu historial de {n} partido{'s' if n>1 else ''} anterior{'es' if n>1 else ''}. "
-                           f"Puedes decirme cosas como \"igual que siempre\" o \"todo bien menos el saque\"._")
+                hist_msg = (
+                    f"\n📚 _Cargué tu historial de {n} partido{'s' if n>1 else ''} "
+                    f"anterior{'es' if n>1 else ''}. "
+                    f"Puedes decirme cosas como \"igual que siempre\" o \"todo bien menos el saque\"._"
+                )
             await update.message.reply_text(
-                f"👋 Bienvenido de vuelta, {user.first_name}.\n\n"
+                f"👋 Bienvenido de vuelta{', ' + nombre.split()[0] if nombre else ''}.\n\n"
                 f"📊 Nivel actual: *{nivel}* · Partidos registrados: *{partidos}*\n\n"
                 f"Cuando termines un partido, cuéntame qué pasó.{hist_msg}\n\n"
                 "Comandos: /nuevo · /resumen · /historial · /minivel",
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
-            # Autorizado pero sin perfil — lanzar evaluación inicial
-            sessions[chat_id] = {
-                "draft": {}, "step": "evaluacion",
-                "pending_field": None, "eval_idx": 0, "eval_data": {},
-            }
-            await update.message.reply_text(
-                f"🎾 ¡Hola {user.first_name}! Soy tu *Coach de Pádel*.\n\n"
-                "Antes de tu primer partido, necesito conocer tu nivel actual. "
-                "Voy a hacerte *9 preguntas rápidas* — elige la opción que mejor te describe.\n\n"
-                "Solo toma 2 minutos. 👇",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            await enviar_pregunta_evaluacion(chat_id, context, 0)
+            # Autorizado pero sin perfil — onboarding completo
+            await iniciar_onboarding(chat_id, user, context)
         return
 
-    # ── Usuario nuevo — pedir código de invitación ────────────────────────
-    # Verificar si ya nos dieron el código en args (deep link) o en sesión previa
+    # ── Usuario nuevo — pedir código ──────────────────────────────────────
     codigo_ingresado = args[0].strip() if args else ""
-
-    # Si no vino por deep link, revisar si ya lo tenemos en sesión
     if not codigo_ingresado:
         session = sessions.get(chat_id, {})
         codigo_ingresado = session.get("codigo_pendiente", "")
 
     if codigo_ingresado == INVITE_CODE:
-        # Código correcto — autorizar y arrancar evaluación
         try:
             autorizar_usuario(user.id, user.username or str(user.id))
         except Exception as e:
             log.error(f"Error autorizando usuario: {e}")
             await update.message.reply_text("❌ Error al registrarte. Intenta de nuevo en un momento.")
             return
-
-        sessions[chat_id] = {
-            "draft": {}, "step": "evaluacion",
-            "pending_field": None, "eval_idx": 0, "eval_data": {},
-        }
-        await update.message.reply_text(
-            f"✅ Acceso confirmado. Bienvenido, {user.first_name}.\n\n"
-            f"Soy tu *Coach de Pádel*. Antes de tu primer partido necesito conocer tu nivel. "
-            f"Voy a hacerte *9 preguntas rápidas*.\n\nSolo toma 2 minutos. 👇",
-            parse_mode=ParseMode.MARKDOWN
+        await iniciar_onboarding(
+            chat_id, user, context,
+            msg=(
+                f"✅ Acceso confirmado. Bienvenido, {user.first_name}.\n\n"
+                "Soy tu *Coach de Pádel*. Antes de tu primer partido necesito conocer tu nivel. "
+                "Voy a hacerte *9 preguntas rápidas*.\n\nSolo toma 2 minutos. 👇"
+            )
         )
-        await enviar_pregunta_evaluacion(chat_id, context, 0)
-
     else:
-        # Sin código válido — pedir que lo escriba
         sessions[chat_id] = {"draft": {}, "step": "waiting_invite", "pending_field": None}
         await update.message.reply_text(
             "🔒 Este bot es privado.\n\n"
@@ -1212,61 +1343,75 @@ async def enviar_pregunta_evaluacion(chat_id: int, context: ContextTypes.DEFAULT
     )
 
 async def finalizar_evaluacion(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Calcula nivel inicial y crea el perfil en Supabase."""
-    session = sessions.get(chat_id, {})
+    """Calcula nivel inicial y pide nombre + username antes de guardar el perfil."""
+    session   = sessions.get(chat_id, {})
     eval_data = session.get("eval_data", {})
     user_data = session.get("_user", {})
 
-    # Calcular score promedio (excluye años de experiencia del promedio técnico)
     dims_tecnicas = ["derecha", "reves", "servicio", "volea", "rebotes", "globos", "bolas_altas", "estilo_juego"]
-    valores = [eval_data.get(d, 0) for d in dims_tecnicas]
+    valores       = [eval_data.get(d, 0) for d in dims_tecnicas]
     score_promedio = sum(valores) / len(valores) if valores else 0
-
-    # Boost menor por años de experiencia (max +0.3)
-    anos_score = eval_data.get("anos_experiencia", 0)
-    boost = min(anos_score * 0.06, 0.3)
-    score_final = min(score_promedio + boost, 5.0)
-
+    anos_score    = eval_data.get("anos_experiencia", 0)
+    score_final   = min(score_promedio + min(anos_score * 0.06, 0.3), 5.0)
     nivel_inicial = score_a_categoria(score_final)
 
-    # Guardar perfil
+    # Guardar nivel calculado en sesión y pasar a recolección de nombre
+    session["nivel_inicial_calculado"] = nivel_inicial
+    session["step"] = "waiting_nombre"
+
+    desc = CATEGORIAS_DESC.get(nivel_inicial, "")
+    await context.bot.send_message(
+        chat_id,
+        f"✅ *Evaluación completa.*\n\n"
+        f"📊 *Tu nivel inicial: {nivel_inicial}*\n"
+        f"_{desc}_\n\n"
+        f"Antes de empezar, necesito tu nombre completo para que tus compañeros de juego puedan encontrarte. "
+        f"¿Cuál es tu nombre y apellido?",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def guardar_perfil_y_continuar(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
+                                      nombre: str, telegram_username: str):
+    """Guarda el perfil completo y muestra mensaje de bienvenida final."""
+    session   = sessions.get(chat_id, {})
+    eval_data = session.get("eval_data", {})
+    user_data = session.get("_user", {})
+    nivel     = session.get("nivel_inicial_calculado", "5ta alta")
+
     try:
         guardar_perfil(
             user_id=user_data.get("id"),
             username=user_data.get("username", ""),
             eval_data=eval_data,
-            nivel_inicial=nivel_inicial,
+            nivel_inicial=nivel,
+            nombre=nombre,
+            telegram_username=telegram_username,
         )
-        log.info(f"Perfil guardado para user_id={user_data.get('id')} nivel={nivel_inicial}")
+        log.info(f"Perfil guardado: {nombre} @{telegram_username} nivel={nivel}")
     except Exception as e:
         log.error(f"Error guardando perfil: {e}")
-        await context.bot.send_message(chat_id, f"⚠️ No se pudo guardar tu perfil en la base de datos.\nError: `{e}`\n\nIntenta /start de nuevo.", parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(chat_id,
+            f"⚠️ No se pudo guardar tu perfil.\nError: `{e}`\n\nIntenta /start de nuevo.",
+            parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Descripción de ese nivel
-    desc = CATEGORIAS_DESC.get(nivel_inicial, "")
-
-    # Resetear sesión para flujo normal de partido
-    sessions[chat_id] = {"draft": {}, "step": "waiting_input", "pending_field": None}
+    historial = obtener_historial(user_data.get("id"), limite=5)
+    sessions[chat_id] = {
+        "draft": {}, "step": "waiting_input",
+        "pending_field": None, "historial": historial,
+    }
 
     await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"✅ *Evaluación completa.*\n\n"
-            f"📊 *Tu nivel inicial: {nivel_inicial}*\n"
-            f"_{desc}_\n\n"
-            f"Este es tu punto de partida. Con cada partido que registres, voy ajustando tu nivel "
-            f"según tus resultados reales.\n\n"
-            f"¡Listo! Cuando termines un partido, cuéntame qué pasó. "
-            f"Puedes mandarme un audio, escribir o mezclar los dos. 🎾\n\n"
-            f"─────────────────────\n"
-            f"*Comandos disponibles:*\n"
-            f"/nuevo — registrar un partido nuevo\n"
-            f"/resumen — ver el análisis de tu último partido\n"
-            f"/historial — tus últimos 5 partidos con scores\n"
-            f"/minivel — tu nivel actual y progreso\n"
-            f"/borrar — borrar la sesión en curso"
-        ),
+        chat_id,
+        f"🎾 *¡Listo, {nombre.split()[0]}!* Tu perfil está completo.\n\n"
+        f"Cuando termines un partido cuéntame cómo les fue — por audio o texto.\n\n"
+        f"─────────────────────\n"
+        f"*Comandos disponibles:*\n"
+        f"/nuevo — registrar un partido nuevo\n"
+        f"/resumen — ver el análisis de tu último partido\n"
+        f"/historial — tus últimos 5 partidos con scores\n"
+        f"/minivel — tu nivel actual y progreso\n"
+        f"/borrar — borrar la sesión en curso",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -1664,7 +1809,51 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(chat_id)
     data    = query.data
 
-    # ── eval|dimension|valor — respuesta del cuestionario inicial ────────────
+    # ── partner_partido|resultado|nivel — partner acepta registrar partido ──
+    if data.startswith("partner_partido|"):
+        parts         = data.split("|")
+        resultado     = parts[1] if len(parts) > 1 else ""
+        nivel_rivales = parts[2] if len(parts) > 2 else ""
+        historial     = obtener_historial(user.id, limite=5)
+        sessions[chat_id] = {
+            "draft":         {"resultado": resultado, "nivel_rivales": nivel_rivales},
+            "step":          "waiting_input",
+            "pending_field": None,
+            "historial":     historial,
+        }
+        await query.edit_message_text(
+            f"✅ Partido cargado:\n"
+            f"• Resultado: *{resultado}*\n"
+            f"• Rivales: *{nivel_rivales}*\n\n"
+            f"Ahora cuéntame tu percepción — cómo te sentiste, qué funcionó y qué no. "
+            f"Audio o texto, como prefieras.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # ── partner_no — partner rechaza el partido ───────────────────────────
+    if data == "partner_no":
+        await query.edit_message_text("Entendido, ignoramos ese partido. 👍")
+        return
+
+    # ── set_username|valor — confirmación de username ────────────────────────
+    if data.startswith("set_username|"):
+        _, valor = data.split("|", 1)
+        session  = get_session(chat_id)
+        nombre   = session.get("nombre_pendiente", "")
+
+        if valor == "manual":
+            session["step"] = "waiting_username"
+            await query.edit_message_text(
+                "Escribe tu @username de Telegram (ej: _@brunof_):",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await query.edit_message_text(f"✅ Username confirmado: *{valor}*", parse_mode=ParseMode.MARKDOWN)
+            await guardar_perfil_y_continuar(chat_id, context, nombre, valor)
+        return
+
+
     if data.startswith("eval|"):
         _, dim_id, valor_str = data.split("|", 2)
         session.setdefault("eval_data", {})[dim_id] = int(valor_str)
@@ -1751,7 +1940,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         texto = formatear_analisis(analysis, draft)
         await enviar_analisis(chat_id, context, analysis, draft)
 
-        # Preguntas opcionales
+        # 5. Detectar y notificar partner si fue mencionado
+        texto_original = session.get("texto_original", "")
+        partner_query  = detectar_partner_en_texto(texto_original)
+        if partner_query:
+            partner = buscar_jugador_por_nombre_o_username(partner_query)
+            if partner and str(partner.get("user_id")) != str(user.id):
+                perfil_remitente = obtener_perfil(user.id)
+                nombre_remitente = (perfil_remitente or {}).get("nombre") or user.first_name or "Tu compañero"
+                await notificar_partner(partner, draft, analysis, nombre_remitente, context)
+                await context.bot.send_message(
+                    chat_id,
+                    f"📨 Le avisé a *{partner.get('nombre', partner_query)}* para que registre su percepción del partido.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            elif partner_query and not partner:
+                await context.bot.send_message(
+                    chat_id,
+                    f"⚠️ No encontré a _{partner_query}_ en la base. "
+                    f"Asegúrate de que use el bot y tenga su perfil creado.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
         await context.bot.send_message(
             chat_id,
             "💬 *¿Querés agregar algo más?* (opcional)\n"
