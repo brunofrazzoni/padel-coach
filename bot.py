@@ -1,9 +1,4 @@
-"""
-Coach Pádel Bot — Telegram + Whisper + Claude + Supabase
-Stack: python-telegram-bot 21.6, anthropic, groq (whisper), supabase-py
-"""
-
-import os, json, logging, tempfile, re
+import os, json, logging, tempfile, re, traceback
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -19,7 +14,13 @@ from groq import Groq
 from supabase import create_client
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ── LOGGING — formato enriquecido con función y línea ─────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s [%(funcName)s:%(lineno)d] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 log = logging.getLogger(__name__)
 
 # ── CLIENTES ──────────────────────────────────────────────────────────────────
@@ -27,8 +28,59 @@ claude    = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 groq      = Groq(api_key=os.environ["GROQ_API_KEY"])
 supabase  = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-INVITE_CODE  = os.environ.get("INVITE_CODE", "padel2024")  # código secreto de invitación
+INVITE_CODE  = os.environ.get("INVITE_CODE", "padel2024")
 ADMIN_IDS    = set(int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip())
+
+# ── TELEGRAM ERROR REPORTER ───────────────────────────────────────────────────
+# Se inicializa en main() una vez que el bot está corriendo
+_bot_instance = None
+
+async def notify_admins_error(context_or_bot, error_msg: str, extra: str = ""):
+    """Manda errores críticos por Telegram a todos los admins."""
+    if not ADMIN_IDS:
+        return
+    bot = getattr(context_or_bot, 'bot', context_or_bot)
+    texto = (
+        f"🚨 *Error en PadelCoach Bot*\n\n"
+        f"`{error_msg[:800]}`"
+        + (f"\n\n_{extra[:200]}_" if extra else "")
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, texto, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass  # No entrar en loop si el envío al admin también falla
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Handler global — captura cualquier excepción no manejada y la reporta."""
+    tb = "".join(traceback.format_exception(
+        type(context.error), context.error, context.error.__traceback__
+    ))
+    log.error(f"Excepción no manejada:\n{tb}")
+
+    # Extraer info del update para contexto
+    extra = ""
+    if isinstance(update, Update):
+        user = update.effective_user
+        chat = update.effective_chat
+        text = ""
+        if update.message:
+            text = (update.message.text or "")[:60]
+        extra = f"user={getattr(user,'id','?')} chat={getattr(chat,'id','?')} msg='{text}'"
+
+    await notify_admins_error(context, tb[-800:], extra)
+
+    # Intentar responder al usuario con mensaje amigable
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                "⚠️ Ocurrió un error inesperado. Ya notifiqué al equipo. Intenta de nuevo en un momento."
+            )
+    except Exception:
+        pass
+
+
 
 # Cache en memoria para evitar consultas a Supabase en cada mensaje
 _autorizados_cache: set[int] = set()
@@ -1037,6 +1089,8 @@ Responde de forma directa y útil para su nivel. Máximo 3-4 párrafos cortos.
 async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
                                 texto: str, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(chat_id)
+    step    = session.get("step", "")
+    log.info(f"procesar_texto_libre user={user_id} step='{step}' texto='{texto[:50]}'")
 
     # ── Recolección de nombre ────────────────────────────────────────────────
     if session.get("step") == "waiting_nombre":
@@ -2022,6 +2076,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO,                   handle_foto))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_error_handler(global_error_handler)
 
     log.info("Bot iniciado.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
