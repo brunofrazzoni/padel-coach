@@ -1739,29 +1739,51 @@ async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user    = update.effective_user
     chat_id = update.effective_chat.id
+    texto   = update.message.text
     session = sessions.get(chat_id, {})
 
-    if not autorizado(user.id):
-        if session.get("step") == "waiting_invite":
-            # Tiene sesión esperando código — dejar pasar
-            pass
-        else:
-            # Usuario desconocido sin sesión activa — pedirle /start
-            await context.bot.send_message(
-                chat_id,
-                "Escribe /start para acceder al bot."
-            )
-            return
+    # ── Paso 1: ¿Está esperando código de invitación? ────────────────────
+    if session.get("step") == "waiting_invite":
+        await procesar_texto_libre(chat_id, user.id, user.username or str(user.id), texto, context)
+        return
 
-    await procesar_texto_libre(
-        chat_id, user.id, user.username or str(user.id),
-        update.message.text, context
-    )
+    # ── Paso 2: ¿Está autorizado? ─────────────────────────────────────────
+    if not autorizado(user.id):
+        # Cualquier mensaje de usuario desconocido → pedir código
+        sessions[chat_id] = {"draft": {}, "step": "waiting_invite", "pending_field": None}
+        await context.bot.send_message(
+            chat_id,
+            "👋 Hola. Este bot es privado.\n\n"
+            "Si tienes un código de acceso, escríbelo acá:"
+        )
+        return
+
+    # ── Paso 3: Autorizado — ¿tiene perfil? ──────────────────────────────
+    perfil = obtener_perfil(user.id)
+    if not perfil:
+        # Autorizado pero sin perfil → onboarding
+        await iniciar_onboarding(chat_id, user, context)
+        return
+
+    # ── Paso 4: Usuario completo — procesar normalmente ───────────────────
+    await procesar_texto_libre(chat_id, user.id, user.username or str(user.id), texto, context)
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorizado(update.effective_user.id):
+    user    = update.effective_user
+    chat_id = update.effective_chat.id
+    msg     = update.message
+
+    if not autorizado(user.id):
+        sessions[chat_id] = {"draft": {}, "step": "waiting_invite", "pending_field": None}
+        await context.bot.send_message(chat_id,
+            "👋 Hola. Este bot es privado.\n\nSi tienes un código de acceso, escríbelo acá:")
         return
-    msg = update.message
+
+    perfil = obtener_perfil(user.id)
+    if not perfil:
+        await iniciar_onboarding(chat_id, user, context)
+        return
+
     file_obj = msg.voice or msg.audio
     if not file_obj:
         return
@@ -2004,4 +2026,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
