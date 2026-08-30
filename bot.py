@@ -860,27 +860,42 @@ async def mostrar_resumen_y_confirmar(chat_id: int, context: ContextTypes.DEFAUL
 
 def detectar_intent(texto: str) -> str:
     """
-    Detecta si el usuario está pidiendo una acción del sistema
-    en vez de reportar un partido. Retorna el intent o 'partido'.
-    Rápido y barato — sin llamada a Claude, solo reglas semánticas simples.
+    Detecta si el usuario está pidiendo una acción del sistema,
+    haciendo conversación, o reportando un partido.
     """
     t = texto.lower().strip()
 
-    historial_keywords = ["historial", "partidos anteriores", "mis partidos", "cuántos partidos", "cuantos partidos", "últimos partidos", "ultimos partidos"]
-    nivel_keywords     = ["mi nivel", "cómo voy", "como voy", "qué nivel", "que nivel", "mi progreso", "progreso", "cuánto he mejorado", "cuanto he mejorado", "en qué categoría", "en que categoria"]
-    resumen_keywords   = ["último análisis", "ultimo analisis", "último partido", "ultimo partido", "qué fue lo último", "que fue lo ultimo", "lo que trabajamos", "resumen", "mi análisis", "mi analisis"]
-    nuevo_keywords     = ["nuevo partido", "registrar partido", "quiero registrar", "empezar partido", "partido nuevo", "agregar partido"]
-    ayuda_keywords     = ["ayuda", "comandos", "qué puedes hacer", "que puedes hacer", "cómo funciona", "como funciona", "qué haces", "que haces"]
+    # Saludos y conversación general
+    saludos = ["hola", "buenas", "buen día", "buen dia", "buenos días", "buenos dias",
+               "buenas tardes", "buenas noches", "hey", "hi ", "hello", "qué tal", "que tal",
+               "cómo estás", "como estas", "cómo está", "como esta", "cómo te va", "como te va"]
+    for kw in saludos:
+        if t == kw or t.startswith(kw + " ") or t.startswith(kw + "!") or t.startswith(kw + ","):
+            return "saludo"
 
-    for kw in historial_keywords:
+    historial_kw = ["historial", "partidos anteriores", "mis partidos", "cuántos partidos",
+                    "cuantos partidos", "últimos partidos", "ultimos partidos"]
+    nivel_kw     = ["mi nivel", "cómo voy", "como voy", "qué nivel", "que nivel",
+                    "mi progreso", "progreso", "cuánto he mejorado", "cuanto he mejorado",
+                    "en qué categoría", "en que categoria"]
+    resumen_kw   = ["último análisis", "ultimo analisis", "último partido", "ultimo partido",
+                    "qué fue lo último", "que fue lo ultimo", "lo que trabajamos",
+                    "resumen", "mi análisis", "mi analisis"]
+    nuevo_kw     = ["nuevo partido", "registrar partido", "quiero registrar",
+                    "empezar partido", "partido nuevo", "agregar partido"]
+    ayuda_kw     = ["ayuda", "comandos", "qué puedes hacer", "que puedes hacer",
+                    "cómo funciona", "como funciona", "qué haces", "que haces",
+                    "instrucciones", "para qué sirves", "para que sirves"]
+
+    for kw in historial_kw:
         if kw in t: return "historial"
-    for kw in nivel_keywords:
+    for kw in nivel_kw:
         if kw in t: return "minivel"
-    for kw in resumen_keywords:
+    for kw in resumen_kw:
         if kw in t: return "resumen"
-    for kw in nuevo_keywords:
+    for kw in nuevo_kw:
         if kw in t: return "nuevo"
-    for kw in ayuda_keywords:
+    for kw in ayuda_kw:
         if kw in t: return "ayuda"
 
     return "partido"
@@ -942,7 +957,24 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
     # Pero primero — detectar si el usuario está pidiendo algo del sistema
     if session.get("step") == "waiting_input":
         intent = detectar_intent(texto)
-        if intent == "historial":
+        if intent == "saludo":
+            perfil   = obtener_perfil(user_id)
+            nivel    = perfil.get("nivel_actual", "—") if perfil else "—"
+            partidos = perfil.get("partidos_total", 0) if perfil else 0
+            hist_tip = " Puedes decirme cosas como _\"igual que siempre pero con más errores en la red\"_." if partidos > 0 else ""
+            await context.bot.send_message(
+                chat_id,
+                f"👋 ¡Hola! Soy tu coach de pádel.\n\n"
+                f"📊 Nivel actual: *{nivel}* · Partidos registrados: *{partidos}*\n\n"
+                f"Cuando termines un partido cuéntame cómo les fue — por audio o texto.{hist_tip}\n\n"
+                f"También puedes preguntarme:\n"
+                f"• _\"cómo voy\"_ — tu nivel y progreso\n"
+                f"• _\"mis partidos\"_ — historial\n"
+                f"• _\"último análisis\"_ — resumen anterior",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        elif intent == "historial":
             await cmd_historial_chat(chat_id, user_id, context)
             return
         elif intent == "minivel":
@@ -985,7 +1017,18 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
             parse_mode=ParseMode.MARKDOWN
         )
     else:
-        await context.bot.send_message(chat_id, "🤔 No pude extraer datos de eso. Intenta ser más específico.")
+        await context.bot.send_message(
+            chat_id,
+            "🤔 No pude entender eso como datos de un partido.\n\n"
+            "Cuéntame cómo les fue — por ejemplo:\n"
+            "_\"Ganamos 6-4 6-2 contra rivales de 4ta, el saque estuvo bien pero cometimos errores en la red\"_\n\n"
+            "O si quieres hacer otra cosa:\n"
+            "• _\"cómo voy\"_ — tu nivel y progreso\n"
+            "• _\"mis partidos\"_ — historial\n"
+            "• _\"último análisis\"_ — resumen anterior\n"
+            "• _\"ayuda\"_ — ver todas las opciones",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
     # Verificar si faltan campos
     faltan = await pedir_siguiente_campo(chat_id, context, session)
