@@ -1337,6 +1337,141 @@ async def cmd_nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
+async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sincroniza la base de conocimiento de Notion → Supabase. Solo admins."""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Solo los administradores pueden ejecutar este comando.")
+        return
+
+    await update.message.reply_text("⏳ Sincronizando base de conocimiento desde Notion...")
+
+    notion_token = os.environ.get("NOTION_TOKEN")
+    notion_db_id = os.environ.get("NOTION_DB_ID", "3cbcc5b1585380129610fa527cc98995")
+
+    if not notion_token:
+        await update.message.reply_text("❌ Falta la variable NOTION_TOKEN en Railway.")
+        return
+
+    try:
+        import httpx as _httpx
+
+        headers = {
+            "Authorization":  f"Bearer {notion_token}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type":   "application/json",
+        }
+
+        # Fetch páginas de Notion
+        pages, cursor = [], None
+        while True:
+            body = {"page_size": 100}
+            if cursor:
+                body["start_cursor"] = cursor
+            resp = _httpx.post(
+                f"https://api.notion.com/v1/databases/{notion_db_id}/query",
+                headers=headers, json=body, timeout=15
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            pages.extend(data.get("results", []))
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+
+        ok = err = skip = 0
+        for page in pages:
+            props   = page.get("properties", {})
+            page_id = page["id"].replace("-", "")
+
+            def _txt(p):
+                t = p.get("type","")
+                items = p.get("title",[]) if t=="title" else p.get("rich_text",[])
+                return "".join(i.get("plain_text","") for i in items).strip()
+
+            def _sel(p):
+                return (p.get("select") or {}).get("name","").strip().lower()
+
+            def _url(p):
+                return (p.get("url") or "").strip()
+
+            activo_prop = props.get("activo", props.get("Activo", {"type":"checkbox","checkbox":True}))
+            if not activo_prop.get("checkbox", True):
+                skip += 1
+                continue
+
+            titulo = (
+                _txt(props.get("Golpe",{})) or
+                _txt(props.get("titulo",{})) or
+                _txt(props.get("Name",{}))
+            )
+            if not titulo:
+                skip += 1
+                continue
+
+            contenido = (
+                _txt(props.get("Explicación Técnica",{})) or
+                _txt(props.get("Explicacion Tecnica",{})) or
+                _txt(props.get("contenido",{}))
+            )
+
+            # Leer bloques si contenido vacío
+            if not contenido:
+                try:
+                    br = _httpx.get(
+                        f"https://api.notion.com/v1/blocks/{page['id']}/children",
+                        headers=headers, timeout=10
+                    )
+                    bloques = br.json().get("results", [])
+                    contenido = "\n".join(
+                        "".join(t.get("plain_text","") for t in b.get(b.get("type",""),{}).get("rich_text",[]))
+                        for b in bloques
+                    ).strip()
+                except Exception:
+                    pass
+
+            nivel_raw = (
+                _sel(props.get("Nivel Recomendado",{})) or
+                _sel(props.get("nivel_objetivo",{}))
+            )
+            nivel_map = {
+                "principiante":"principiante","intermedio":"intermedio",
+                "avanzado":"avanzado","avanzado / profesional":"avanzado","todos":"todos"
+            }
+            nivel_objetivo = nivel_map.get(nivel_raw, nivel_raw or "todos")
+
+            row = {
+                "notion_id":      page_id,
+                "titulo":         titulo,
+                "categoria":      _sel(props.get("categoria",{})) or _sel(props.get("Categoría",{})) or "técnica",
+                "nivel_objetivo": nivel_objetivo,
+                "golpe":          titulo.lower(),
+                "contenido":      contenido,
+                "frase_coach":    _txt(props.get("frase_coach",{})) or _txt(props.get("Frase coach",{})),
+                "media_url":      _url(props.get("URL del Vídeo",{})) or _url(props.get("media_url",{})),
+                "activo":         True,
+                "ultima_sync":    datetime.utcnow().isoformat(),
+            }
+
+            try:
+                supabase.table("conocimiento_padel").upsert(row, on_conflict="notion_id").execute()
+                ok += 1
+            except Exception as e:
+                log.error(f"Sync error {titulo}: {e}")
+                err += 1
+
+        await update.message.reply_text(
+            f"✅ *Sync completo*\n\n"
+            f"• {ok} fichas sincronizadas\n"
+            f"• {skip} saltadas\n"
+            f"• {err} errores",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    except Exception as e:
+        log.error(f"Error en /sync: {e}")
+        await update.message.reply_text(f"❌ Error durante el sync:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Verifica que el bot está vivo y que Supabase responde."""
     if not autorizado(update.effective_user.id):
@@ -1642,6 +1777,7 @@ def main():
 
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("ping",      cmd_ping))
+    app.add_handler(CommandHandler("sync",      cmd_sync))
     app.add_handler(CommandHandler("nuevo",     cmd_nuevo))
     app.add_handler(CommandHandler("borrar",    cmd_borrar))
     app.add_handler(CommandHandler("historial", cmd_historial))
