@@ -712,17 +712,25 @@ Responde SOLO con este JSON (sin markdown):
 
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1400,
+        max_tokens=2000,
         messages=[{"role": "user", "content": prompt}]
     )
-    resp = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1400,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw   = resp.content[0].text.strip()
-    clean = re.sub(r"```json|```", "", raw).strip()
-    return json.loads(clean)
+    try:
+        raw   = resp.content[0].text.strip()
+        log.info(f"analizar_con_claude raw response length={len(raw)}")
+        clean = re.sub(r"```json|```", "", raw).strip()
+        # Intentar parsear directamente
+        try:
+            return json.loads(clean)
+        except json.JSONDecodeError:
+            # Intentar extraer el JSON con regex si hay texto extra
+            match = re.search(r'\{.*\}', clean, re.DOTALL)
+            if match:
+                return json.loads(match.group())
+            raise
+    except Exception as e:
+        log.error(f"analizar_con_claude JSON parse error: {e}\nraw={raw[:300]}")
+        raise
 
 # ── SUPABASE ──────────────────────────────────────────────────────────────────
 
