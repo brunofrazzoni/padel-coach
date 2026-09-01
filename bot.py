@@ -15,6 +15,9 @@ from supabase import create_client
 
 load_dotenv()
 
+# ── VERSIÓN ────────────────────────────────────────────────────────────────────
+BOT_VERSION = "01/09/2026 17:45"  # última actualización
+
 # ── LOGGING — formato enriquecido con función y línea ─────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -75,7 +78,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         if isinstance(update, Update) and update.effective_chat:
             await context.bot.send_message(
                 update.effective_chat.id,
-                "⚠️ Ocurrió un error inesperado. Ya notifiqué al equipo. Intenta de nuevo en un momento."
+                f"⚠️ Ocurrió un error inesperado. Ya notifiqué al equipo.\n_v{BOT_VERSION}_"
             )
     except Exception:
         pass
@@ -1740,7 +1743,7 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_status = f"❌ Supabase error: `{e}`"
 
     await update.message.reply_text(
-        f"🟢 Bot activo.\n{db_status}",
+        f"🟢 Bot activo · v{BOT_VERSION}\n{db_status}",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -2140,4 +2143,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
