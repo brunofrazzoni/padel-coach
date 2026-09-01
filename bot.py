@@ -16,7 +16,7 @@ from supabase import create_client
 load_dotenv()
 
 # ── VERSIÓN ────────────────────────────────────────────────────────────────────
-BOT_VERSION = "01/09/2026 17:45"  # última actualización
+BOT_VERSION = "01/09/2026 18:45"  # última actualización
 
 # ── LOGGING — formato enriquecido con función y línea ─────────────────────────
 logging.basicConfig(
@@ -990,11 +990,13 @@ def detectar_intent(texto: str) -> str:
         if kw in t: return "nuevo"
     for kw in ayuda_kw:
         if kw in t: return "ayuda"
-    # Consulta técnica: solo si hay pregunta explícita
-    for kw in consulta_kw:
-        if kw in t: return "consulta_tecnica"
-    # Nombre de golpe solo (mensaje muy corto, sin contexto de partido)
-    if len(t.split()) <= 4:
+    # Consulta técnica: solo si hay signo de pregunta O mensaje muy corto
+    es_pregunta = "?" in texto
+    es_corto    = len(t.split()) <= 6
+
+    if es_pregunta or es_corto:
+        for kw in consulta_kw:
+            if kw in t: return "consulta_tecnica"
         for kw in golpes_kw:
             if t == kw or t == f"la {kw}" or t == f"el {kw}" or t == f"la {kw}?" or t == f"el {kw}?":
                 return "consulta_tecnica"
