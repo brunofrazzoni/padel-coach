@@ -971,7 +971,8 @@ def detectar_intent(texto: str) -> str:
                     "cómo ejecuto", "como ejecuto", "explícame", "explicame",
                     "cómo mejoro", "como mejoro", "técnica de", "tecnica de",
                     "cómo se juega", "como se juega", "tips de", "consejo sobre",
-                    "háblame de", "hablame de"]
+                    "háblame de", "hablame de", "información sobre", "informacion sobre",
+                    "enséñame", "ensenme", "qué es la", "que es la", "qué es el", "que es el"]
     golpes_kw    = ["bandeja", "víbora", "vibora", "volea", "globo", "smash", "remate",
                     "chiquita", "volcada", "bajada de pared", "contrapared", "bote pronto",
                     "dormilona", "salida de pared", "revés", "reves", "saque", "servicio"]
@@ -986,11 +987,14 @@ def detectar_intent(texto: str) -> str:
         if kw in t: return "nuevo"
     for kw in ayuda_kw:
         if kw in t: return "ayuda"
+    # Consulta técnica: solo si hay pregunta explícita
     for kw in consulta_kw:
         if kw in t: return "consulta_tecnica"
-    for kw in golpes_kw:
-        if t == kw or t == f"la {kw}" or t == f"el {kw}":
-            return "consulta_tecnica"
+    # Nombre de golpe solo (mensaje muy corto, sin contexto de partido)
+    if len(t.split()) <= 4:
+        for kw in golpes_kw:
+            if t == kw or t == f"la {kw}" or t == f"el {kw}" or t == f"la {kw}?" or t == f"el {kw}?":
+                return "consulta_tecnica"
 
     return "partido"
 
@@ -1041,67 +1045,6 @@ async def notificar_partner(partner: dict, draft: dict, analysis: dict,
         )
     except Exception as e:
         log.error(f"Error notificando partner {partner_user_id}: {e}")
-
-
-    """
-    Detecta si el usuario está pidiendo una acción del sistema,
-    haciendo conversación, o reportando un partido.
-    """
-    t = texto.lower().strip()
-
-    # Saludos y conversación general
-    saludos = ["hola", "buenas", "buen día", "buen dia", "buenos días", "buenos dias",
-               "buenas tardes", "buenas noches", "hey", "hi ", "hello", "qué tal", "que tal",
-               "cómo estás", "como estas", "cómo está", "como esta", "cómo te va", "como te va"]
-    for kw in saludos:
-        if t == kw or t.startswith(kw + " ") or t.startswith(kw + "!") or t.startswith(kw + ","):
-            return "saludo"
-
-    historial_kw = ["historial", "partidos anteriores", "mis partidos", "cuántos partidos",
-                    "cuantos partidos", "últimos partidos", "ultimos partidos"]
-    nivel_kw     = ["mi nivel", "cómo voy", "como voy", "qué nivel", "que nivel",
-                    "mi progreso", "progreso", "cuánto he mejorado", "cuanto he mejorado",
-                    "en qué categoría", "en que categoria"]
-    resumen_kw   = ["último análisis", "ultimo analisis", "último partido", "ultimo partido",
-                    "qué fue lo último", "que fue lo ultimo", "lo que trabajamos",
-                    "resumen", "mi análisis", "mi analisis"]
-    nuevo_kw     = ["nuevo partido", "registrar partido", "quiero registrar",
-                    "empezar partido", "partido nuevo", "agregar partido"]
-    ayuda_kw     = ["ayuda", "comandos", "qué puedes hacer", "que puedes hacer",
-                    "cómo funciona", "como funciona", "qué haces", "que haces",
-                    "instrucciones", "para qué sirves", "para que sirves"]
-
-    for kw in historial_kw:
-        if kw in t: return "historial"
-    for kw in nivel_kw:
-        if kw in t: return "minivel"
-    for kw in resumen_kw:
-        if kw in t: return "resumen"
-    for kw in nuevo_kw:
-        if kw in t: return "nuevo"
-    for kw in ayuda_kw:
-        if kw in t: return "ayuda"
-
-    # Consultas técnicas / táctica
-    consulta_kw = ["qué es", "que es", "cómo se hace", "como se hace", "cómo ejecuto",
-                   "como ejecuto", "explícame", "explicame", "enséñame", "ensenme",
-                   "cómo mejoro", "como mejoro", "técnica de", "tecnica de",
-                   "qué es la", "que es la", "qué es el", "que es el",
-                   "cómo se juega", "como se juega", "tips de", "consejo sobre",
-                   "háblame de", "hablame de", "información sobre", "informacion sobre"]
-    for kw in consulta_kw:
-        if t.startswith(kw) or kw in t: return "consulta_tecnica"
-
-    # Nombres directos de golpes también disparan consulta
-    golpes_kw = ["bandeja", "víbora", "vibora", "volea", "globo", "smash", "remate",
-                 "chiquita", "volcada", "bajada de pared", "contra pared", "bote pronto",
-                 "dormilona", "salida de pared", "derecha", "revés", "reves", "saque",
-                 "servicio", "resto"]
-    for kw in golpes_kw:
-        if t == kw or t == f"la {kw}" or t == f"el {kw}":
-            return "consulta_tecnica"
-
-    return "partido"
 
 async def responder_consulta_tecnica(chat_id: int, user_id: int, texto: str,
                                       context: ContextTypes.DEFAULT_TYPE):
