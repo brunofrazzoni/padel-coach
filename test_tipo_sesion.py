@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Smoke test de la detección partido vs entrenamiento y del formato de salida.
+Smoke test del router de intenciones, la taxonomía y el formato de salida.
 
 Sólo ejercita funciones puras: los SDKs de red están stubbeados, así que no hace
 falta ni conexión ni API keys reales. Ejecutar con:
@@ -40,23 +40,6 @@ def check(nombre, obtenido, esperado):
     if not ok:
         fallos.append("%s: esperaba %r, obtuvo %r" % (nombre, esperado, obtenido))
 
-
-print("\n== detectar_tipo_sesion ==")
-casos = [
-    ("Ganamos 6-4 6-2 contra rivales de 4ta",                 bot.TIPO_PARTIDO),
-    ("Perdimos el partido, los rivales jugaban muy bien",      bot.TIPO_PARTIDO),
-    ("Jugamos un americano el sábado",                         bot.TIPO_PARTIDO),
-    ("Entrené una hora de bandeja con el profe",               bot.TIPO_ENTRENAMIENTO),
-    ("Hicimos drills de salida de pared y canasta",            bot.TIPO_ENTRENAMIENTO),
-    ("Clase con el entrenador, mucho ejercicio de volea",      bot.TIPO_ENTRENAMIENTO),
-    ("Practicamos sparring toda la tarde",                     bot.TIPO_ENTRENAMIENTO),
-    # Mixtos / ambiguos -> None, decide Claude
-    ("Entrenamos y después jugamos un partido 6-3",            None),
-    ("Estuvo todo bien menos el saque",                        None),
-    ("Igual que siempre",                                      None),
-]
-for texto, esperado in casos:
-    check(repr(texto)[:50], bot.detectar_tipo_sesion(texto), esperado)
 
 print("\n== campos y normalización ==")
 check("normalizar_tipo(None)",           bot.normalizar_tipo(None), bot.TIPO_PARTIDO)
@@ -123,14 +106,44 @@ kb3 = bot.teclado_tipo_entrenamiento()
 check("teclado tipo entrenamiento: 5 opciones + Otro",
       sum(len(f) for f in kb3.inline_keyboard), 6)
 
-print("\n== router: fast path por coincidencia exacta ==")
-check("'Hola!' normaliza y matchea",     bot.intent_exacto("Hola!"),  ("saludo", None))
-check("'  cómo voy  ' matchea",          bot.intent_exacto("  cómo voy  "), ("minivel", None))
-check("'nuevo entrenamiento' trae tipo", bot.intent_exacto("nuevo entrenamiento"),
-      ("nuevo", bot.TIPO_ENTRENAMIENTO))
-check("'hola, ganamos 6-4' NO es exacto", bot.intent_exacto("hola, ganamos 6-4"), None)
-check("'cómo voy con la bandeja' NO es exacto",
-      bot.intent_exacto("cómo voy con la bandeja"), None)
+print("\n== taxonomía de intenciones ==")
+check("13 intenciones declaradas", len(bot.INTENTS), 13)
+check("las 5 que pidió el usuario están",
+      {"registrar_partido", "registrar_entrenamiento", "consejo_tecnico",
+       "consejo_tactico", "consejo_emocional"} <= set(bot.INTENTS), True)
+check("registro mapea a tipo de sesión",
+      bot.INTENTS_REGISTRO,
+      {"registrar_partido": bot.TIPO_PARTIDO,
+       "registrar_entrenamiento": bot.TIPO_ENTRENAMIENTO})
+check("cada intención de consejo tiene categoría de conocimiento",
+      sorted(c for c, _, _ in bot.CATEGORIAS_CONSEJO.values()),
+      ["emocional", "táctica", "técnica"])
+check("los consejos son intenciones válidas",
+      set(bot.CATEGORIAS_CONSEJO) <= set(bot.INTENTS), True)
+check("todo ejemplo del prompt apunta a una intención real",
+      sorted({i for _, i in bot.EJEMPLOS_ROUTER} - set(bot.INTENTS)), [])
+check("hay al menos un ejemplo por intención",
+      sorted(set(bot.INTENTS) - {i for _, i in bot.EJEMPLOS_ROUTER}), [])
+
+print("\n== no queda detección por texto ==")
+for muerta in ("detectar_intent", "detectar_tipo_sesion", "intent_exacto",
+               "FRASES_EXACTAS", "ENTRENAMIENTO_KW", "PARTIDO_KW", "RE_MARCADOR"):
+    check("%s fue eliminada" % muerta, hasattr(bot, muerta), False)
+
+print("\n== modelos ==")
+check("todos los modelos por defecto son Haiku",
+      {bot.MODELO_ROUTER, bot.MODELO_EXTRACCION, bot.MODELO_ANALISIS,
+       bot.MODELO_CONSEJO, bot.MODELO_NIVEL},
+      {"claude-haiku-4-5"})
+
+print("\n== prompt del router ==")
+p_sin = bot._prompt_router("ganamos 6-4")
+p_con = bot._prompt_router("el saque fue 8", {"resultado": "6-4"}, bot.TIPO_PARTIDO)
+check("sin borrador, avisa que corregir no aplica",
+      '"corregir" no aplica' in p_sin, True)
+check("con borrador, nombra los campos ya cargados",
+      "resultado" in p_con and "registrando un partido" in p_con, True)
+check("el mensaje del jugador va en el prompt", "ganamos 6-4" in p_sin, True)
 
 
 class RespuestaFalsa:
@@ -140,17 +153,19 @@ class RespuestaFalsa:
 
 
 class ClaudeFalso:
-    """Cuenta llamadas y devuelve (o lanza) lo que se le indique."""
-    def __init__(self, devuelve=None, lanza=None):
-        self.devuelve, self.lanza, self.llamadas = devuelve, lanza, 0
+    """Devuelve una respuesta por llamada; una excepción se relanza siempre."""
+    def __init__(self, *respuestas, lanza=None):
+        self.respuestas, self.lanza, self.llamadas = list(respuestas), lanza, 0
+        self.modelos  = []
         self.messages = types.SimpleNamespace(create=self._create)
 
     def _create(self, **kw):
         self.llamadas += 1
-        self.modelo = kw.get("model")
+        self.modelos.append(kw.get("model"))
         if self.lanza:
             raise self.lanza
-        return RespuestaFalsa(self.devuelve)
+        i = min(self.llamadas - 1, len(self.respuestas) - 1)
+        return RespuestaFalsa(self.respuestas[i])
 
 
 def con_claude(falso, *args, **kwargs):
@@ -162,48 +177,39 @@ def con_claude(falso, *args, **kwargs):
         bot.claude = original
 
 
-print("\n== router: no gasta API en el fast path ==")
-f = ClaudeFalso(devuelve='{"intent":"reporte","tipo_sesion":null}')
-r = con_claude(f, "hola")
-check("'hola' se resuelve sin llamar a la API", (r["intent"], r["via"], f.llamadas),
-      ("saludo", "exacto", 0))
-
-print("\n== router: los casos que rompían los keywords ==")
-f = ClaudeFalso(devuelve='{"intent": "reporte", "tipo_sesion": "partido"}')
+print("\n== router: casos que rompían los keywords ==")
+f = ClaudeFalso('{"intent": "registrar_partido"}')
 r = con_claude(f, "hola, ganamos 6-4 6-2 contra los de 4ta")
-check("saludo + reporte pegado -> reporte",
-      (r["intent"], r["tipo_sesion"], r["via"]), ("reporte", "partido", "claude"))
-check("usa el modelo router", f.modelo, bot.MODELO_ROUTER)
+check("saludo + reporte pegado -> registrar_partido",
+      (r["intent"], r["via"], f.llamadas), ("registrar_partido", "claude:1", 1))
+check("usa el modelo del router", f.modelos[0], bot.MODELO_ROUTER)
 
-f = ClaudeFalso(devuelve='```json\n{"intent": "consulta_tecnica", "tipo_sesion": null}\n```')
-r = con_claude(f, "cómo voy con la bandeja, siento que no mejoro")
-check("JSON envuelto en markdown se parsea",
-      (r["intent"], r["tipo_sesion"]), ("consulta_tecnica", None))
+f = ClaudeFalso('```json\n{"intent": "consejo_tecnico"}\n```')
+r = con_claude(f, "cómo le pego a la bandeja sin que se vaya larga")
+check("JSON en fences de markdown se parsea", r["intent"], "consejo_tecnico")
 
-print("\n== router: respaldo cuando el modelo falla ==")
+f = ClaudeFalso('{"intent": "consulta_progreso"}')
+r = con_claude(f, "he mejorado el saque estos meses")
+check("pregunta sobre sus datos -> consulta_progreso", r["intent"], "consulta_progreso")
+
+print("\n== router: reintento y fallo definitivo ==")
+f = ClaudeFalso('{"intent": "no_existe"}', '{"intent": "consejo_emocional"}')
+r = con_claude(f, "me pongo nervioso en los puntos importantes")
+check("intent inválido -> reintenta y acierta",
+      (r["intent"], r["via"], f.llamadas), ("consejo_emocional", "claude:2", 2))
+
 f = ClaudeFalso(lanza=RuntimeError("503 upstream"))
-r = con_claude(f, "ganamos 6-3 6-4, el saque muy bien")
-check("excepción -> keywords, sin romper",
-      (r["intent"], r["tipo_sesion"], r["via"]), ("reporte", "partido", "fallback"))
+r = con_claude(f, "ganamos 6-3")
+check("excepción en ambos intentos -> intent None",
+      (r["intent"], r["via"], f.llamadas), (None, "error", 2))
 
-f = ClaudeFalso(devuelve='{"intent": "chachacha", "tipo_sesion": "partido"}')
-r = con_claude(f, "entrené drills de volea con el profe")
-check("intent inválido -> keywords",
-      (r["intent"], r["tipo_sesion"], r["via"]), ("reporte", "entrenamiento", "fallback"))
+f = ClaudeFalso('no soy json', 'tampoco soy json')
+r = con_claude(f, "cualquier cosa")
+check("respuesta no-JSON dos veces -> intent None", r["intent"], None)
 
-f = ClaudeFalso(devuelve='no soy json')
-r = con_claude(f, "hola qué tal todo bien")
-check("respuesta no-JSON -> keywords", r["via"], "fallback")
-
-f = ClaudeFalso(devuelve='{"intent": "reporte", "tipo_sesion": "basura"}')
-r = con_claude(f, "jugamos ayer")
-check("tipo_sesion inválido se descarta",
-      (r["intent"], r["tipo_sesion"]), ("reporte", None))
-
-print("\n== router: contexto de borrador en curso ==")
-f = ClaudeFalso(devuelve='{"intent": "reporte", "tipo_sesion": null}')
-r = con_claude(f, "el saque fue 8", {"resultado": "6-4"}, bot.TIPO_PARTIDO)
-check("corrección con draft abierto -> reporte", r["intent"], "reporte")
+f = ClaudeFalso('{"intent": "chachacha"}', '{"intent": "otra_invencion"}')
+r = con_claude(f, "cualquier cosa")
+check("intent inválido dos veces -> intent None (sin adivinar)", r["intent"], None)
 
 print("\n" + ("TODO OK" if not fallos else "FALLOS:\n" + "\n".join(fallos)))
 sys.exit(1 if fallos else 0)
