@@ -16,15 +16,17 @@ CREATE TABLE IF NOT EXISTS jugadores (
     partidos_total   INT DEFAULT 0
 );
 
--- ── TABLA 2: Partidos registrados ────────────────────────
+-- ── TABLA 2: Sesiones registradas (partidos y entrenamientos) ──
 CREATE TABLE IF NOT EXISTS partidos (
     id               BIGSERIAL PRIMARY KEY,
     user_id          TEXT NOT NULL REFERENCES jugadores(user_id),
     username         TEXT,
     fecha            TIMESTAMPTZ DEFAULT NOW(),
-    nivel_inferido   TEXT,        -- categoría asignada por el bot en este partido
-    resultado        TEXT,
-    nivel_rivales    TEXT,
+    tipo_sesion      TEXT NOT NULL DEFAULT 'partido'
+                     CHECK (tipo_sesion IN ('partido', 'entrenamiento')),
+    nivel_inferido   TEXT,        -- categoría asignada por el bot en esta sesión
+    resultado        TEXT,        -- sólo partidos
+    nivel_rivales    TEXT,        -- sólo partidos
     score_tecnica    NUMERIC(4,1),
     score_tactica    NUMERIC(4,1),
     score_emocional  NUMERIC(4,1),
@@ -36,18 +38,37 @@ CREATE TABLE IF NOT EXISTS partidos (
 CREATE INDEX IF NOT EXISTS idx_jugadores_user_id ON jugadores(user_id);
 CREATE INDEX IF NOT EXISTS idx_partidos_user_id  ON partidos(user_id);
 CREATE INDEX IF NOT EXISTS idx_partidos_fecha    ON partidos(fecha DESC);
+CREATE INDEX IF NOT EXISTS idx_partidos_tipo     ON partidos(user_id, tipo_sesion, fecha DESC);
 
--- ── VISTA: Resumen de partidos con nivel ─────────────────
+-- ── MIGRACIÓN para bases ya existentes ───────────────────
+-- Idempotente: las filas previas quedan marcadas como partidos.
+ALTER TABLE partidos ADD COLUMN IF NOT EXISTS tipo_sesion TEXT NOT NULL DEFAULT 'partido';
+
+DO $$
+BEGIN
+    ALTER TABLE partidos ADD CONSTRAINT partidos_tipo_sesion_check
+        CHECK (tipo_sesion IN ('partido', 'entrenamiento'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
+
+-- ── VISTA: Resumen de sesiones con nivel ─────────────────
+-- DROP explícito: CREATE OR REPLACE sólo permite AÑADIR columnas al final, y
+-- esta versión inserta tipo_sesion / tipo_entrenamiento / foco_sesion en medio.
+DROP VIEW IF EXISTS v_partidos_resumen;
 CREATE OR REPLACE VIEW v_partidos_resumen AS
 SELECT
     p.id,
     j.username,
     p.fecha::DATE                                           AS fecha,
+    p.tipo_sesion,
     j.nivel_inicial,
     p.nivel_inferido                                        AS nivel_partido,
     j.nivel_actual,
     p.resultado,
     p.nivel_rivales,
+    p.datos_raw->>'tipo_entrenamiento'                      AS tipo_entrenamiento,
+    p.datos_raw->>'foco_sesion'                             AS foco_sesion,
     p.score_tecnica,
     p.score_tactica,
     p.score_emocional,

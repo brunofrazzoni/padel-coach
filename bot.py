@@ -16,7 +16,7 @@ from supabase import create_client
 load_dotenv()
 
 # ── VERSIÓN ────────────────────────────────────────────────────────────────────
-BOT_VERSION = "01/09/2026 18:45"  # última actualización
+BOT_VERSION = "02/09/2026 10:00"  # última actualización
 
 # ── LOGGING — formato enriquecido con función y línea ─────────────────────────
 logging.basicConfig(
@@ -382,6 +382,73 @@ CAMPOS_OPCIONALES = {
 
 ESCALAS_0_10 = {k for k in list(CAMPOS.keys())[2:]}  # todos excepto resultado y nivel_rivales
 
+# ── ENTRENAMIENTOS ────────────────────────────────────────────────────────────
+# Un entrenamiento no tiene resultado ni rivales: tiene foco, tipo e intensidad.
+# Las dimensiones técnicas y tácticas se comparten con el partido para que los
+# scores sean comparables; se omiten las que sólo existen en competencia
+# (gestion_marcador, ansiedad pre-partido).
+
+TIPO_PARTIDO       = "partido"
+TIPO_ENTRENAMIENTO = "entrenamiento"
+TIPOS_SESION       = (TIPO_PARTIDO, TIPO_ENTRENAMIENTO)
+
+TIPOS_ENTRENAMIENTO = ["clase", "drills", "sparring", "físico", "mixto"]
+
+CAMPOS_ENTRENAMIENTO = {
+    "tipo_entrenamiento": "¿Qué tipo de sesión fue? (clase, drills, sparring, físico)",
+    "foco_sesion":        "¿En qué se enfocó el entrenamiento? (ej. bandeja, salida de pared)",
+    "saque":              "Saque (0-10): efectividad y dirección",
+    "devolucion":         "Devolución de saque (0-10)",
+    "peloteo":            "Peloteo de fondo — consistencia (0-10)",
+    "juego_red":          "Juego de red — volea y bandeja (0-10)",
+    "globo":              "Globo defensivo — altura y profundidad (0-10)",
+    "posicionamiento":    "Posicionamiento en pareja — rotaciones y centro (0-10)",
+    "uso_red":            "Uso inteligente de la red — subir y mantener (0-10)",
+    "construccion":       "Construcción del punto — sacar al rival de posición (0-10)",
+    "intensidad":         "Intensidad de la sesión (0=suave, 10=al máximo)",
+    "foco":               "Foco durante el entrenamiento (0=distraído, 10=presente)",
+    "gestion_errores":    "Gestión de errores (0=me frustré, 10=los acepté y seguí)",
+    "comunicacion":       "Comunicación con compañero/entrenador (0=nula, 10=clara)",
+}
+
+CAMPOS_OPCIONALES_ENTRENAMIENTO = {
+    "error_golpe":       "¿Qué golpe te costó más? (opcional)",
+    "golpe_bueno":       "¿Qué golpe salió mejor? (opcional)",
+    "ejercicio_dificil": "¿Qué ejercicio te resultó más difícil? (opcional)",
+    "aprendizaje":       "¿Qué te llevas de la sesión? (opcional)",
+    "sensacion_fisica":  "¿Cómo te sentiste físicamente? (opcional)",
+    "dialogo_interno":   "¿Qué te dijiste tras un error? (opcional)",
+}
+
+ESCALAS_0_10 |= {"intensidad"}
+
+# Campos que siempre hay que preguntar cuando el jugador ya tiene historial
+CAMPOS_MINIMOS_POR_TIPO = {
+    TIPO_PARTIDO:       {"resultado", "nivel_rivales"},
+    TIPO_ENTRENAMIENTO: {"tipo_entrenamiento", "foco_sesion"},
+}
+
+
+def normalizar_tipo(tipo_sesion) -> str:
+    """Cualquier valor desconocido o ausente se trata como partido."""
+    return tipo_sesion if tipo_sesion in TIPOS_SESION else TIPO_PARTIDO
+
+
+def campos_de(tipo_sesion) -> dict:
+    """Campos obligatorios según el tipo de sesión."""
+    return (CAMPOS_ENTRENAMIENTO
+            if normalizar_tipo(tipo_sesion) == TIPO_ENTRENAMIENTO else CAMPOS)
+
+
+def campos_opcionales_de(tipo_sesion) -> dict:
+    return (CAMPOS_OPCIONALES_ENTRENAMIENTO
+            if normalizar_tipo(tipo_sesion) == TIPO_ENTRENAMIENTO else CAMPOS_OPCIONALES)
+
+
+def etiqueta_tipo(tipo_sesion) -> str:
+    return ("entrenamiento"
+            if normalizar_tipo(tipo_sesion) == TIPO_ENTRENAMIENTO else "partido")
+
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
 def get_session(chat_id: int) -> dict:
@@ -422,16 +489,32 @@ def teclado_categorias(campo: str) -> InlineKeyboardMarkup:
         filas.append(fila)
     return InlineKeyboardMarkup(filas)
 
-def teclado_confirmacion_final() -> InlineKeyboardMarkup:
+def teclado_tipo_entrenamiento(campo: str = "tipo_entrenamiento") -> InlineKeyboardMarkup:
+    botones = [InlineKeyboardButton(t.capitalize(), callback_data=f"set|{campo}|{t}")
+               for t in TIPOS_ENTRENAMIENTO]
+    filas = [botones[i:i+3] for i in range(0, len(botones), 3)]
+    filas.append([InlineKeyboardButton("✏️ Otro", callback_data=f"manual|{campo}")])
+    return InlineKeyboardMarkup(filas)
+
+def teclado_confirmacion_final(tipo_sesion=TIPO_PARTIDO) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Analizar partido", callback_data="analizar"),
+        InlineKeyboardButton(f"✅ Analizar {etiqueta_tipo(tipo_sesion)}", callback_data="analizar"),
         InlineKeyboardButton("✏️ Corregir algo", callback_data="corregir"),
     ]])
 
-def resumen_draft(draft: dict) -> str:
+def teclado_cambiar_tipo(tipo_actual) -> InlineKeyboardMarkup:
+    """Permite corregir la clasificación automática partido ↔ entrenamiento."""
+    otro = (TIPO_PARTIDO if normalizar_tipo(tipo_actual) == TIPO_ENTRENAMIENTO
+            else TIPO_ENTRENAMIENTO)
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"↔️ En realidad fue un {etiqueta_tipo(otro)}",
+                             callback_data=f"set_tipo|{otro}")
+    ]])
+
+def resumen_draft(draft: dict, tipo_sesion=TIPO_PARTIDO) -> str:
     """Texto con los datos actuales del borrador."""
-    lines = ["*Datos del partido hasta ahora:*\n"]
-    for campo, etiqueta in {**CAMPOS, **CAMPOS_OPCIONALES}.items():
+    lines = [f"*Datos del {etiqueta_tipo(tipo_sesion)} hasta ahora:*\n"]
+    for campo, etiqueta in {**campos_de(tipo_sesion), **campos_opcionales_de(tipo_sesion)}.items():
         val = draft.get(campo)
         if val is not None:
             label = etiqueta.split("(")[0].strip().rstrip("—").strip()
@@ -458,6 +541,41 @@ async def transcribir_audio(file_bytes: bytes, suffix: str = ".ogg") -> str:
 
 # ── EXTRACCIÓN CON CLAUDE ─────────────────────────────────────────────────────
 
+def linea_historial(p: dict) -> str:
+    """Una línea legible de una sesión pasada, sea partido o entrenamiento."""
+    tipo = normalizar_tipo(p.get("tipo_sesion"))
+    if tipo == TIPO_ENTRENAMIENTO:
+        datos = p.get("datos_raw") or {}
+        if isinstance(datos, str):
+            try:
+                datos = json.loads(datos)
+            except Exception:
+                datos = {}
+        ctx = f"tipo={datos.get('tipo_entrenamiento','?')} foco={datos.get('foco_sesion','?')}"
+    else:
+        ctx = f"resultado={p.get('resultado','?')} rivales={p.get('nivel_rivales','?')}"
+    return (f"- {str(p.get('fecha','?'))[:10]} [{tipo}]: {ctx} "
+            f"T={p.get('score_tecnica','?')} TÁC={p.get('score_tactica','?')} "
+            f"EM={p.get('score_emocional','?')}")
+
+
+def icono_sesion(p: dict) -> str:
+    return "🏋️" if normalizar_tipo(p.get("tipo_sesion")) == TIPO_ENTRENAMIENTO else "🎾"
+
+
+def descriptor_sesion(p: dict) -> str:
+    """Qué mostrar de una sesión en un listado: marcador o foco del entrenamiento."""
+    if normalizar_tipo(p.get("tipo_sesion")) != TIPO_ENTRENAMIENTO:
+        return str(p.get("resultado") or "?")
+    datos = p.get("datos_raw") or {}
+    if isinstance(datos, str):
+        try:
+            datos = json.loads(datos)
+        except Exception:
+            datos = {}
+    return str(datos.get("foco_sesion") or datos.get("tipo_entrenamiento") or "entrenamiento")
+
+
 def construir_contexto_historial(historial: list) -> dict:
     """
     Calcula promedios y patrones del historial reciente.
@@ -468,7 +586,7 @@ def construir_contexto_historial(historial: list) -> dict:
 
     dims = ["saque", "devolucion", "peloteo", "juego_red", "globo",
             "posicionamiento", "uso_red", "construccion", "gestion_marcador",
-            "ansiedad", "foco", "gestion_errores", "comunicacion"]
+            "ansiedad", "foco", "gestion_errores", "comunicacion", "intensidad"]
 
     promedios = {}
     for dim in dims:
@@ -495,15 +613,42 @@ def construir_contexto_historial(historial: list) -> dict:
 
     return promedios
 
-def extraer_datos_claude(texto: str, draft_actual: dict, historial: list = None) -> dict:
+def extraer_datos_claude(texto: str, draft_actual: dict, historial: list = None,
+                         tipo_sesion=None) -> dict:
     """
     Claude lee el texto del usuario y extrae campos.
     Con historial, puede inferir valores de frases como 'igual que siempre' o
     'todo bien menos el saque' sin necesitar input explícito para cada campo.
+
+    Si tipo_sesion es None, Claude además clasifica partido vs entrenamiento y
+    devuelve la clave "tipo_sesion" — es el paso 2 del híbrido de detección
+    (keywords obvias primero, Claude como desempate).
     """
-    campos_json = json.dumps({k: v for k, v in {**CAMPOS, **CAMPOS_OPCIONALES}.items()}, ensure_ascii=False, indent=2)
-    draft_json  = json.dumps(draft_actual, ensure_ascii=False)
+    draft_json         = json.dumps(draft_actual, ensure_ascii=False)
     categorias_validas = ", ".join(CATEGORIAS)
+
+    if tipo_sesion is None:
+        campos_json = json.dumps({
+            TIPO_PARTIDO:       {**CAMPOS, **CAMPOS_OPCIONALES},
+            TIPO_ENTRENAMIENTO: {**CAMPOS_ENTRENAMIENTO, **CAMPOS_OPCIONALES_ENTRENAMIENTO},
+        }, ensure_ascii=False, indent=2)
+        bloque_tipo = f"""PASO 1 — CLASIFICA LA SESIÓN (las keywords no alcanzaron para decidir):
+- PARTIDO: hubo competencia real — marcador, rivales, torneo, americano, sets.
+- ENTRENAMIENTO: clase, drills, sparring, canasta, ejercicios, práctica libre.
+- Si entrenó y además jugó puntos sueltos sin marcador, es ENTRENAMIENTO.
+- Si hay un marcador competitivo, es PARTIDO aunque haya empezado calentando.
+Incluye SIEMPRE la clave "tipo_sesion" con el valor "{TIPO_PARTIDO}" o "{TIPO_ENTRENAMIENTO}".
+
+PASO 2 — EXTRAE SOLO LOS CAMPOS DEL TIPO QUE ELEGISTE:
+{campos_json}"""
+    else:
+        campos_json = json.dumps(
+            {**campos_de(tipo_sesion), **campos_opcionales_de(tipo_sesion)},
+            ensure_ascii=False, indent=2)
+        bloque_tipo = f"""TIPO DE SESIÓN YA CONFIRMADO: {normalizar_tipo(tipo_sesion)}
+
+CAMPOS QUE NECESITAS EXTRAER:
+{campos_json}"""
 
     # Construir contexto de historial
     historial = historial or []
@@ -511,32 +656,26 @@ def extraer_datos_claude(texto: str, draft_actual: dict, historial: list = None)
 
     if ctx_hist:
         hist_txt = f"""
-HISTORIAL RECIENTE DEL JUGADOR (promedios de últimos {min(len(historial),5)} partidos):
+HISTORIAL RECIENTE DEL JUGADOR (promedios de las últimas {min(len(historial),5)} sesiones):
 {json.dumps(ctx_hist, ensure_ascii=False, indent=2)}
 
-PARTIDOS ANTERIORES (para entender referencias como "igual que siempre" o "peor que el partido pasado"):
-""" + "\n".join(
-    f"- {str(p.get('fecha','?'))[:10]}: resultado={p.get('resultado','?')} "
-    f"rivales={p.get('nivel_rivales','?')} "
-    f"T={p.get('score_tecnica','?')} TÁC={p.get('score_tactica','?')} EM={p.get('score_emocional','?')}"
-    for p in historial[:3]
-)
+SESIONES ANTERIORES (para entender referencias como "igual que siempre" o "peor que la vez pasada"):
+""" + "\n".join(linea_historial(p) for p in historial[:3])
         reglas_hist = """
 REGLAS ESPECIALES CON HISTORIAL:
 - Si el usuario dice "igual que siempre", "como siempre", "normal", o similar → usa el promedio histórico para los campos no mencionados.
 - Si dice "todo bien menos X" → usa promedios históricos para todo excepto X, que lo marcas según lo que dijo.
-- Si dice "peor que el partido pasado" → baja ~2 puntos del promedio histórico para los campos relevantes.
+- Si dice "peor que la vez pasada" → baja ~2 puntos del promedio histórico para los campos relevantes.
 - Si dice "mejor que siempre" → sube ~1-2 puntos del promedio histórico.
 - Si menciona un campo específico con un valor claro, ese valor tiene prioridad absoluta sobre el historial.
 - Puedes inferir nivel_rivales del historial si el usuario dice "los mismos de siempre" o "rivales similares"."""
     else:
-        hist_txt  = "\nPRIMER PARTIDO — sin historial disponible."
+        hist_txt    = "\nPRIMERA SESIÓN — sin historial disponible."
         reglas_hist = ""
 
-    prompt = f"""Eres un asistente inteligente extrayendo datos de un reporte post-partido de pádel.
+    prompt = f"""Eres un asistente inteligente extrayendo datos del reporte de una sesión de pádel. La sesión puede ser un partido o un entrenamiento.
 
-CAMPOS QUE NECESITAS EXTRAER:
-{campos_json}
+{bloque_tipo}
 
 DATOS YA RECOPILADOS EN ESTA SESIÓN (no los repitas):
 {draft_json}
@@ -547,14 +686,17 @@ TEXTO DEL USUARIO:
 
 REGLAS DE EXTRACCIÓN BASE:
 - Campos numéricos 0-10: "bien"→7, "regular"→5, "mal"→3, "muy bien"→8, "excelente"→9, "pésimo"→2, "bastante bien"→8, "no tan bien"→4.
-- Para "resultado": formato "X-Y / A-B". Un set: "X-Y".
-- Para "nivel_rivales": mapea a categorías exactas: {categorias_validas}.
+- Solo en PARTIDO — "resultado": formato "X-Y / A-B". Un set: "X-Y".
+- Solo en PARTIDO — "nivel_rivales": mapea a categorías exactas: {categorias_validas}.
+- Solo en ENTRENAMIENTO — "tipo_entrenamiento": uno de {", ".join(TIPOS_ENTRENAMIENTO)}.
 - NUNCA extraigas "nivel_propio".
+- No inventes campos que no pertenezcan al tipo de sesión elegido.
 - Solo incluye campos que puedas inferir con confianza (directamente o via historial).
 {reglas_hist}
 
 Responde SOLO con JSON. Sin markdown.
-Ejemplo con historial: {{"resultado": "6-4 / 3-6", "saque": 6, "devolucion": 7, "peloteo": 5}}"""
+Ejemplo partido: {{"tipo_sesion": "partido", "resultado": "6-4 / 3-6", "saque": 6, "peloteo": 5}}
+Ejemplo entrenamiento: {{"tipo_sesion": "entrenamiento", "tipo_entrenamiento": "drills", "foco_sesion": "bandeja", "juego_red": 7}}"""
 
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
@@ -564,9 +706,10 @@ Ejemplo con historial: {{"resultado": "6-4 / 3-6", "saque": 6, "devolucion": 7, 
     raw   = resp.content[0].text.strip()
     clean = re.sub(r"```json|```", "", raw).strip()
     try:
-        return json.loads(clean)
+        datos = json.loads(clean)
     except Exception:
         return {}
+    return datos if isinstance(datos, dict) else {}
 
 def buscar_conocimiento(query: str, nivel: str, limite: int = 5) -> str:
     """
@@ -624,45 +767,64 @@ def buscar_conocimiento(query: str, nivel: str, limite: int = 5) -> str:
         log.warning(f"Error buscando conocimiento: {e}")
         return ""
 
-def analizar_con_claude(draft: dict, historial: list, nivel_inferido: str) -> dict:
-    """Genera el análisis completo del partido como coach con memoria acumulada."""
+def analizar_con_claude(draft: dict, historial: list, nivel_inferido: str,
+                        tipo_sesion=TIPO_PARTIDO) -> dict:
+    """Genera el análisis completo de la sesión como coach con memoria acumulada."""
 
+    tipo       = normalizar_tipo(tipo_sesion)
+    es_entren  = tipo == TIPO_ENTRENAMIENTO
     desc_nivel = CATEGORIAS_DESC.get(nivel_inferido, "")
 
-    # Buscar conocimiento relevante según lo que pasó en el partido
-    query_conocimiento = " ".join(filter(None, [
-        draft.get("error_golpe", ""),
-        draft.get("error_tactico", ""),
-        draft.get("golpe_bueno", ""),
-        draft.get("patron_bueno", ""),
-    ])) or "técnica básica posicionamiento"
+    # Buscar conocimiento relevante según lo que pasó en la sesión
+    campos_query = (["foco_sesion", "ejercicio_dificil", "error_golpe", "golpe_bueno"]
+                    if es_entren else
+                    ["error_golpe", "error_tactico", "golpe_bueno", "patron_bueno"])
+    query_conocimiento = " ".join(
+        filter(None, (draft.get(c, "") for c in campos_query))
+    ) or "técnica básica posicionamiento"
 
     conocimiento = buscar_conocimiento(query_conocimiento, nivel_inferido)
     bloque_conocimiento = f"""
 CONOCIMIENTO TÉCNICO RELEVANTE (úsalo para dar consejos específicos, no genéricos):
 {conocimiento}
 """ if conocimiento else ""
+
+    def _prioridad(p: dict) -> str:
+        raw = p.get("analisis_raw")
+        if not raw:
+            return ""
+        try:
+            a = json.loads(raw) if isinstance(raw, str) else raw
+            return a.get("prioridad_semana", "")
+        except Exception:
+            return ""
+
     if historial:
         ctx = construir_contexto_historial(historial)
         promedios_txt = json.dumps(ctx, ensure_ascii=False, indent=2)
 
-        # Detectar tendencias por dimensión
-        partidos_txt = "\n".join(
-            f"- {str(p.get('fecha','?'))[:10]}: resultado={p.get('resultado','?')} "
-            f"rivales={p.get('nivel_rivales','?')} "
-            f"T={p.get('score_tecnica','?')} TÁC={p.get('score_tactica','?')} EM={p.get('score_emocional','?')} "
-            f"prioridad='{json.loads(p['analisis_raw']).get('prioridad_semana','') if p.get('analisis_raw') else ''}'"
-            for p in historial[:5]
+        sesiones_txt = "\n".join(
+            f"{linea_historial(p)} prioridad='{_prioridad(p)}'" for p in historial[:5]
         )
 
         hist_bloque = f"""
-HISTORIAL DE PARTIDOS (más reciente primero):
-{partidos_txt}
+HISTORIAL DE {etiqueta_tipo(tipo).upper()}S (más reciente primero):
+{sesiones_txt}
 
 PROMEDIOS HISTÓRICOS (baseline del jugador):
 {promedios_txt}
 """
-        instrucciones_hist = f"""
+        if es_entren:
+            instrucciones_hist = """
+INSTRUCCIONES CON HISTORIAL — CRÍTICAS:
+- NO resumas lo que el usuario ya te dijo de la sesión. Eso lo sabe. Tu valor está en lo que él NO ve.
+- Detecta si el foco de hoy ya se venía trabajando y si hay progreso medible respecto a sesiones anteriores.
+- Si lleva varias sesiones entrenando lo mismo sin mejora, dilo con datos y propone cambiar el enfoque.
+- Si entrena siempre lo mismo y descuida otra dimensión, nómbralo.
+- Conecta el trabajo de hoy con los errores que se repiten en sus partidos.
+"""
+        else:
+            instrucciones_hist = """
 INSTRUCCIONES CON HISTORIAL — CRÍTICAS:
 - NO resumas lo que el usuario ya te dijo del partido. Eso lo sabe. Tu valor está en lo que él NO ve.
 - Detecta si algo que fue problema antes mejoró hoy → celébralo explícitamente ("la semana pasada tu saque fallaba, hoy estuvo sólido").
@@ -673,15 +835,74 @@ INSTRUCCIONES CON HISTORIAL — CRÍTICAS:
 - Si hay un patrón emocional recurrente (ej. hoyos emocionales en momentos de presión), trabájalo explícitamente.
 """
     else:
-        hist_bloque = "\nPRIMER PARTIDO REGISTRADO — sin historial previo."
-        instrucciones_hist = "- Es el primer partido. Establece una línea base clara y sé alentador."
+        hist_bloque = f"\nPRIMER {etiqueta_tipo(tipo).upper()} REGISTRADO — sin historial previo de este tipo."
+        instrucciones_hist = f"- Es el primer {etiqueta_tipo(tipo)}. Establece una línea base clara y sé alentador."
 
-    prompt = f"""Eres un coach de pádel con memoria de todos los partidos del jugador. Tu rol NO es resumir lo que pasó — el jugador ya lo sabe. Tu rol es actuar como un coach que ha seguido su progreso, que recuerda sus debilidades, celebra sus avances reales y traza el camino hacia la siguiente categoría.
+    if es_entren:
+        rol = ("Eres un coach de pádel con memoria de todas las sesiones del jugador. "
+               "Hoy te reportó un ENTRENAMIENTO, no un partido. Tu rol NO es resumir lo que pasó — "
+               "el jugador ya lo sabe. Tu rol es convertir la sesión en aprendizaje transferible a la "
+               "cancha: qué se consolidó, qué falta repetir y cómo llevarlo al partido.")
+        reglas_tipo = (
+            "- NO evalúes resultado ni rivales — en un entrenamiento no existen.\n"
+            "- Valora proceso y repetición, no victoria: consistencia, intención y calidad del gesto.\n"
+            "- Conecta el trabajo de hoy con los errores que aparecen en sus partidos.\n"
+            "- Si la intensidad fue baja pero el foco alto (o viceversa), coméntalo."
+        )
+        formulas = (
+            '  "score_tecnica": <promedio de saque+devolucion+peloteo+juego_red+globo, un decimal>,\n'
+            '  "score_tactica": <promedio de posicionamiento+uso_red+construccion, un decimal>,\n'
+            '  "score_emocional": <promedio de foco+gestion_errores+comunicacion, un decimal>,'
+        )
+        campos_narrativos = (
+            '  "emoji_partido": "<emoji representativo de la sesión>",\n'
+            '  "resumen": "<1-2 frases sobre qué tipo de entrenamiento fue y qué dejó — no los datos>",\n'
+            '  "celebracion_tecnica": "<qué gesto técnico se consolidó o mejoró hoy>",\n'
+            '  "celebracion_tactica": "<qué decisión o patrón táctico quedó más claro tras la sesión>",\n'
+            '  "celebracion_emocional": "<foco, paciencia o actitud ante la repetición y el error>",\n'
+            '  "consejo_tecnico": "<la corrección técnica más importante para la próxima sesión>",\n'
+            '  "consejo_tactico": "<cómo trasladar lo entrenado hoy a la situación real de partido>",\n'
+            '  "consejo_emocional": "<herramienta concreta para sostener el foco cuando el drill se hace largo>",\n'
+            '  "prioridad_semana": "<UNA prioridad para la próxima sesión o partido>",\n'
+            '  "patron_detectado": "<el insight que sólo se ve mirando el historial completo>",\n'
+            f'  "mensaje_nivel": "<qué debe entrenar para acercarse a la categoría siguiente a {nivel_inferido}>"'
+        )
+        titulo_datos = "DATOS DEL ENTRENAMIENTO DE HOY"
+    else:
+        rol = ("Eres un coach de pádel con memoria de todos los partidos del jugador. Tu rol NO es "
+               "resumir lo que pasó — el jugador ya lo sabe. Tu rol es actuar como un coach que ha "
+               "seguido su progreso, que recuerda sus debilidades, celebra sus avances reales y traza "
+               "el camino hacia la siguiente categoría.")
+        reglas_tipo = (
+            "- Si ganaron a rivales de categoría superior, reconócelo.\n"
+            "- Celebra progresos reales con evidencia del historial, no elogios vacíos."
+        )
+        formulas = (
+            '  "score_tecnica": <promedio de saque+devolucion+peloteo+juego_red+globo, un decimal>,\n'
+            '  "score_tactica": <promedio de posicionamiento+uso_red+construccion+gestion_marcador, un decimal>,\n'
+            '  "score_emocional": <promedio de (10-ansiedad)+foco+gestion_errores+comunicacion dividido 4, un decimal>,'
+        )
+        campos_narrativos = (
+            '  "emoji_partido": "<emoji representativo del partido>",\n'
+            '  "resumen": "<1-2 frases que capturen la narrativa del partido — qué tipo de partido fue, no los datos>",\n'
+            '  "celebracion_tecnica": "<algo técnico que mejoró vs historial o fue consistentemente bueno. Con referencia al historial si existe.>",\n'
+            '  "celebracion_tactica": "<logro táctico real de hoy. Conecta con lo que venían trabajando si hay historial.>",\n'
+            '  "celebracion_emocional": "<celebra manejo emocional si fue bueno. Si hubo hoyos pero salieron, reconoce la resiliencia. Honesto pero constructivo.>",\n'
+            '  "consejo_tecnico": "<el error técnico más importante de hoy, con una corrección concreta y práctica para su nivel>",\n'
+            '  "consejo_tactico": "<ajuste táctico específico. Si es un patrón recurrente del historial, dilo.>",\n'
+            '  "consejo_emocional": "<si hay patrón emocional recurrente, nómbralo. Da una herramienta concreta: respiración, frase ancla, rutina entre puntos.>",\n'
+            '  "prioridad_semana": "<UNA sola prioridad de entrenamiento para esta semana. Diferente a la semana pasada si ya fue trabajada.>",\n'
+            '  "patron_detectado": "<el insight más valioso que solo se ve mirando el historial completo. Algo que el jugador no vería partido a partido.>",\n'
+            f'  "mensaje_nivel": "<qué falta específicamente para subir de {nivel_inferido} a la siguiente categoría, basado en lo que ves hoy>"'
+        )
+        titulo_datos = "DATOS DEL PARTIDO DE HOY"
+
+    prompt = f"""{rol}
 
 NIVEL ACTUAL: {nivel_inferido}
 Descripción: {desc_nivel}
 
-DATOS DEL PARTIDO DE HOY:
+{titulo_datos}:
 {json.dumps(draft, ensure_ascii=False, indent=2)}
 {bloque_conocimiento}
 {hist_bloque}
@@ -690,27 +911,14 @@ DATOS DEL PARTIDO DE HOY:
 REGLAS GENERALES:
 - Tono: directo, cercano, como un coach que te conoce. No formal, no genérico.
 - Consejos apropiados para {nivel_inferido} — ni muy básicos ni fuera de alcance.
-- Si ganaron a rivales de categoría superior, reconócelo.
-- Celebra progresos reales con evidencia del historial, no elogios vacíos.
 - Un solo consejo por dimensión — el más importante, no una lista.
+{reglas_tipo}
 
 Responde SOLO con este JSON (sin markdown):
 {{
-  "score_tecnica": <promedio de saque+devolucion+peloteo+juego_red+globo, un decimal>,
-  "score_tactica": <promedio de posicionamiento+uso_red+construccion+gestion_marcador, un decimal>,
-  "score_emocional": <promedio de (10-ansiedad)+foco+gestion_errores+comunicacion dividido 4, un decimal>,
+{formulas}
   "nivel_inferido": "{nivel_inferido}",
-  "emoji_partido": "<emoji representativo del partido>",
-  "resumen": "<1-2 frases que capturen la narrativa del partido — qué tipo de partido fue, no los datos>",
-  "celebracion_tecnica": "<algo técnico que mejoró vs historial o fue consistentemente bueno. Con referencia al historial si existe.>",
-  "celebracion_tactica": "<logro táctico real de hoy. Conecta con lo que venían trabajando si hay historial.>",
-  "celebracion_emocional": "<celebra manejo emocional si fue bueno. Si hubo hoyos pero salieron, reconoce la resiliencia. Honesto pero constructivo.>",
-  "consejo_tecnico": "<el error técnico más importante de hoy, con una corrección concreta y práctica para su nivel>",
-  "consejo_tactico": "<ajuste táctico específico. Si es un patrón recurrente del historial, dilo.>",
-  "consejo_emocional": "<si hay patrón emocional recurrente, nómbralo. Da una herramienta concreta: respiración, frase ancla, rutina entre puntos.>",
-  "prioridad_semana": "<UNA sola prioridad de entrenamiento para esta semana. Diferente a la semana pasada si ya fue trabajada.>",
-  "patron_detectado": "<el insight más valioso que solo se ve mirando el historial completo. Algo que el jugador no vería partido a partido.>",
-  "mensaje_nivel": "<qué falta específicamente para subir de {nivel_inferido} a la siguiente categoría, basado en lo que ves hoy>"
+{campos_narrativos}
 }}"""
 
     resp = claude.messages.create(
@@ -720,7 +928,7 @@ Responde SOLO con este JSON (sin markdown):
     )
     try:
         raw   = resp.content[0].text.strip()
-        log.info(f"analizar_con_claude raw response length={len(raw)}")
+        log.info(f"analizar_con_claude tipo={tipo} raw response length={len(raw)}")
         clean = re.sub(r"```json|```", "", raw).strip()
         # Intentar parsear directamente
         try:
@@ -737,11 +945,13 @@ Responde SOLO con este JSON (sin markdown):
 
 # ── SUPABASE ──────────────────────────────────────────────────────────────────
 
-def guardar_partido(user_id: int, username: str, draft: dict, analysis: dict, nivel_inferido: str) -> None:
+def guardar_sesion(user_id: int, username: str, draft: dict, analysis: dict,
+                   nivel_inferido: str, tipo_sesion=TIPO_PARTIDO) -> None:
     row = {
         "user_id":         str(user_id),
         "username":        username,
         "fecha":           datetime.utcnow().isoformat(),
+        "tipo_sesion":     normalizar_tipo(tipo_sesion),
         "nivel_inferido":  nivel_inferido,
         "resultado":       draft.get("resultado"),
         "nivel_rivales":   draft.get("nivel_rivales"),
@@ -753,13 +963,15 @@ def guardar_partido(user_id: int, username: str, draft: dict, analysis: dict, ni
     }
     supabase.table("partidos").insert(row).execute()
 
-def obtener_historial(user_id: int, limite: int = 10) -> list:
-    resp = (supabase.table("partidos")
-            .select("fecha,resultado,score_tecnica,score_tactica,score_emocional,nivel_inferido,nivel_rivales,datos_raw")
-            .eq("user_id", str(user_id))
-            .order("fecha", desc=True)
-            .limit(limite)
-            .execute())
+def obtener_historial(user_id: int, limite: int = 10, tipo_sesion=None) -> list:
+    """Si tipo_sesion viene dado, filtra a partidos o entrenamientos."""
+    q = (supabase.table("partidos")
+         .select("fecha,tipo_sesion,resultado,score_tecnica,score_tactica,score_emocional,"
+                 "nivel_inferido,nivel_rivales,datos_raw,analisis_raw")
+         .eq("user_id", str(user_id)))
+    if tipo_sesion is not None:
+        q = q.eq("tipo_sesion", normalizar_tipo(tipo_sesion))
+    resp = q.order("fecha", desc=True).limit(limite).execute()
     return resp.data or []
 
 def inferir_nivel_claude(historial: list, perfil: dict | None) -> str:
@@ -768,6 +980,11 @@ def inferir_nivel_claude(historial: list, perfil: dict | None) -> str:
     Si no hay historial suficiente, devuelve el nivel del perfil sin cambios.
     """
     nivel_base = (perfil or {}).get("nivel_actual", "6ta")
+
+    # El nivel competitivo se infiere sólo de partidos: un entrenamiento no es
+    # evidencia de rendimiento frente a rivales de una categoría.
+    historial = [p for p in (historial or [])
+                 if normalizar_tipo(p.get("tipo_sesion")) == TIPO_PARTIDO]
 
     if not historial:
         return nivel_base
@@ -778,9 +995,6 @@ def inferir_nivel_claude(historial: list, perfil: dict | None) -> str:
 
     hist_lines = []
     for p in historial:
-        datos = p.get("datos_raw") or {}
-        if isinstance(datos, str):
-            datos = json.loads(datos)
         hist_lines.append(
             f"- {str(p.get('fecha','?'))[:10]} | "
             f"resultado={p.get('resultado','?')} | "
@@ -826,7 +1040,7 @@ Responde SOLO con el nombre exacto de la categoría. Sin explicación."""
 
 # ── FORMATO DE ANÁLISIS PARA TELEGRAM ────────────────────────────────────────
 
-def formatear_analisis(a: dict, draft: dict) -> list[str]:
+def formatear_analisis(a: dict, draft: dict, tipo_sesion=TIPO_PARTIDO) -> list[str]:
     """Devuelve el análisis dividido en 4 mensajes para no superar el límite de 4096 chars de Telegram."""
     st    = a.get("score_tecnica", 0)
     sa    = a.get("score_tactica", 0)
@@ -836,9 +1050,22 @@ def formatear_analisis(a: dict, draft: dict) -> list[str]:
     def emoji_score(s):
         return "🟢" if s >= 7 else "🟡" if s >= 4.5 else "🔴"
 
+    if normalizar_tipo(tipo_sesion) == TIPO_ENTRENAMIENTO:
+        cabecera = (
+            f"{a.get('emoji_partido','🏋️')} *Entrenamiento: {draft.get('foco_sesion','—')}*\n"
+            f"Tu nivel: *{nivel}* · Tipo: {draft.get('tipo_entrenamiento','—')}"
+        )
+        if draft.get("intensidad") is not None:
+            cabecera += f" · Intensidad: {draft['intensidad']}/10"
+        cabecera += "\n"
+    else:
+        cabecera = (
+            f"{a.get('emoji_partido','🎾')} *Resultado: {draft.get('resultado','—')}*\n"
+            f"Tu nivel: *{nivel}* · Rivales: {draft.get('nivel_rivales','—')}\n"
+        )
+
     msg1 = (
-        f"{a.get('emoji_partido','🎾')} *Resultado: {draft.get('resultado','—')}*\n"
-        f"Tu nivel: *{nivel}* · Rivales: {draft.get('nivel_rivales','—')}\n\n"
+        f"{cabecera}\n"
         f"{emoji_score(st)} Técnica: *{st}/10* · "
         f"{emoji_score(sa)} Táctica: *{sa}/10* · "
         f"{emoji_score(se)} Emocional: *{se}/10*\n\n"
@@ -874,29 +1101,30 @@ def formatear_analisis(a: dict, draft: dict) -> list[str]:
 
     return [msg1, msg2, msg3, msg4]
 
-async def enviar_analisis(chat_id: int, context, a: dict, draft: dict):
+async def enviar_analisis(chat_id: int, context, a: dict, draft: dict,
+                          tipo_sesion=TIPO_PARTIDO):
     """Envía el análisis en mensajes separados para evitar el límite de 4096 chars."""
-    for msg in formatear_analisis(a, draft):
+    for msg in formatear_analisis(a, draft, tipo_sesion):
         await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN)
 
 # ── FLUJO PRINCIPAL ───────────────────────────────────────────────────────────
 
-CAMPOS_MINIMOS = {"resultado", "nivel_rivales"}  # siempre obligatorios
-
 async def pedir_siguiente_campo(chat_id: int, context: ContextTypes.DEFAULT_TYPE, session: dict) -> bool:
     """
-    Con historial: solo pregunta resultado y nivel_rivales si faltan.
-    Sin historial: pregunta todos los campos de CAMPOS en orden.
+    Con historial: solo pregunta los campos mínimos del tipo de sesión si faltan.
+    Sin historial: pregunta todos los campos del tipo en orden.
     Retorna True si había algo pendiente, False si todo está completo.
     """
     draft    = session["draft"]
+    tipo     = normalizar_tipo(session.get("tipo_sesion"))
+    campos   = campos_de(tipo)
     hay_hist = bool(session.get("historial"))
 
     # Determinar qué campos son obligatorios según contexto
-    campos_requeridos = CAMPOS_MINIMOS if hay_hist else set(CAMPOS.keys())
+    campos_requeridos = CAMPOS_MINIMOS_POR_TIPO[tipo] if hay_hist else set(campos.keys())
 
     # Buscar primer campo faltante
-    for campo, etiqueta in CAMPOS.items():
+    for campo, etiqueta in campos.items():
         if campo not in campos_requeridos:
             continue
         if draft.get(campo) is not None:
@@ -907,6 +1135,8 @@ async def pedir_siguiente_campo(chat_id: int, context: ContextTypes.DEFAULT_TYPE
 
         if campo == "nivel_rivales":
             kb = teclado_categorias(campo)
+        elif campo == "tipo_entrenamiento":
+            kb = teclado_tipo_entrenamiento(campo)
         elif campo in ESCALAS_0_10:
             kb = teclado_escala(campo)
         else:
@@ -928,7 +1158,7 @@ async def pedir_siguiente_campo(chat_id: int, context: ContextTypes.DEFAULT_TYPE
         for dim, promedio in ctx.items():
             if dim == "nivel_rivales_habitual":
                 continue
-            if draft.get(dim) is None and dim in CAMPOS:
+            if draft.get(dim) is None and dim in campos:
                 draft[dim] = promedio  # usar promedio histórico como fallback silencioso
 
     return False  # listo para analizar
@@ -936,14 +1166,57 @@ async def pedir_siguiente_campo(chat_id: int, context: ContextTypes.DEFAULT_TYPE
 
 async def mostrar_resumen_y_confirmar(chat_id: int, context: ContextTypes.DEFAULT_TYPE, session: dict):
     session["step"] = "ready"
-    texto = resumen_draft(session["draft"])
-    texto += "\n\n¿Todo correcto? Puedo analizar el partido ahora."
+    tipo  = normalizar_tipo(session.get("tipo_sesion"))
+    texto = resumen_draft(session["draft"], tipo)
+    texto += f"\n\n¿Todo correcto? Puedo analizar el {etiqueta_tipo(tipo)} ahora."
     await context.bot.send_message(
         chat_id=chat_id,
         text=texto,
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=teclado_confirmacion_final()
+        reply_markup=teclado_confirmacion_final(tipo)
     )
+
+# ── DETECCIÓN PARTIDO vs ENTRENAMIENTO ────────────────────────────────────────
+# Híbrido en dos pasos: keywords obvias resuelven la mayoría de los casos sin
+# costo; cuando el texto es ambiguo o mixto devolvemos None y desempata Claude
+# dentro de extraer_datos_claude().
+
+ENTRENAMIENTO_KW = [
+    "entrenamiento", "entrenamos", "entrené", "entrene", "entrenando", "entrenar",
+    "clase", "clases", "profe", "entrenador", "academia",
+    "práctica", "practica", "practiqué", "practique", "practicamos", "practicando",
+    "drill", "drills", "ejercicio", "ejercicios", "canasta", "sparring",
+    "máquina de pelotas", "maquina de pelotas", "físico", "fisico", "gimnasio",
+]
+
+PARTIDO_KW = [
+    "partido", "partidazo", "partidos", "jugamos contra", "ganamos", "perdimos",
+    "ganamos el", "perdimos el", "rivales", "rival", "torneo", "campeonato",
+    "americano", "tie break", "tiebreak", "sets", "primer set", "segundo set",
+]
+
+# Un marcador explícito ("6-4", "6/2") es la señal más fuerte de partido
+RE_MARCADOR = re.compile(r"\b\d{1,2}\s*[-/]\s*\d{1,2}\b")
+
+
+def detectar_tipo_sesion(texto: str) -> str | None:
+    """
+    Paso 1 del híbrido. Devuelve TIPO_PARTIDO, TIPO_ENTRENAMIENTO, o None si el
+    texto es ambiguo o mezcla señales de ambos (en cuyo caso decide Claude).
+    """
+    t = f" {texto.lower().strip()} "
+
+    hits_e = sum(1 for kw in ENTRENAMIENTO_KW if kw in t)
+    hits_p = sum(1 for kw in PARTIDO_KW if kw in t)
+    if RE_MARCADOR.search(texto):
+        hits_p += 2
+
+    if hits_e and not hits_p:
+        return TIPO_ENTRENAMIENTO
+    if hits_p and not hits_e:
+        return TIPO_PARTIDO
+    return None  # ambiguo o mixto → desempata Claude
+
 
 def detectar_intent(texto: str) -> str:
     """Detecta si el usuario está pidiendo algo del sistema o reportando un partido."""
@@ -966,7 +1239,9 @@ def detectar_intent(texto: str) -> str:
                     "qué fue lo último", "que fue lo ultimo", "lo que trabajamos",
                     "resumen", "mi análisis", "mi analisis"]
     nuevo_kw     = ["nuevo partido", "registrar partido", "quiero registrar",
-                    "empezar partido", "partido nuevo", "agregar partido"]
+                    "empezar partido", "partido nuevo", "agregar partido",
+                    "nuevo entrenamiento", "registrar entrenamiento",
+                    "entrenamiento nuevo", "agregar entrenamiento"]
     ayuda_kw     = ["ayuda", "comandos", "qué puedes hacer", "que puedes hacer",
                     "cómo funciona", "como funciona", "qué haces", "que haces",
                     "instrucciones", "para qué sirves", "para que sirves"]
@@ -1244,21 +1519,26 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
             return
         elif intent == "nuevo":
             historial = obtener_historial(user_id, limite=5)
+            tipo_nuevo = detectar_tipo_sesion(texto)
             sessions[chat_id] = {
                 "draft": {}, "step": "waiting_input",
                 "pending_field": None, "historial": historial,
+                "tipo_sesion": tipo_nuevo,
             }
-            await context.bot.send_message(chat_id, "✅ Listo. Cuéntame del partido.")
+            que = etiqueta_tipo(tipo_nuevo) if tipo_nuevo else "partido o entrenamiento"
+            await context.bot.send_message(chat_id, f"✅ Listo. Cuéntame del {que}.")
             return
         elif intent == "ayuda":
             await context.bot.send_message(
                 chat_id,
                 "🎾 *Puedo ayudarte con:*\n\n"
-                "• Contarme de un partido (audio o texto)\n"
+                "• Contarme de un partido o un entrenamiento (audio o texto)\n"
                 "• _\"cómo voy\"_ — tu nivel y progreso\n"
                 "• _\"mis partidos\"_ — historial\n"
-                "• _\"último análisis\"_ — resumen del partido anterior\n"
-                "• _\"nuevo partido\"_ — empezar registro\n\n"
+                "• _\"último análisis\"_ — resumen de la sesión anterior\n"
+                "• _\"nuevo partido\"_ / _\"nuevo entrenamiento\"_ — empezar registro\n\n"
+                "Distingo solo si me cuentas un partido o un entrenamiento, "
+                "y si me equivoco lo puedes corregir con un botón.\n\n"
                 "No necesitas usar comandos con `/` — escribe nomás.",
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -1303,26 +1583,47 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
             await cmd_resumen_chat(chat_id, user_id, context)
             return
         elif intent == "nuevo":
-            historial = obtener_historial(user_id, limite=5)
-            sessions[chat_id] = {"draft": {}, "step": "waiting_input", "pending_field": None, "historial": historial}
-            await context.bot.send_message(chat_id, "✅ Listo. Cuéntame del partido.")
+            historial  = obtener_historial(user_id, limite=5)
+            tipo_nuevo = detectar_tipo_sesion(texto)
+            sessions[chat_id] = {"draft": {}, "step": "waiting_input", "pending_field": None,
+                                 "historial": historial, "tipo_sesion": tipo_nuevo}
+            que = etiqueta_tipo(tipo_nuevo) if tipo_nuevo else "partido o entrenamiento"
+            await context.bot.send_message(chat_id, f"✅ Listo. Cuéntame del {que}.")
             return
         elif intent == "ayuda":
             await context.bot.send_message(
                 chat_id,
                 "🎾 *Puedo ayudarte con:*\n\n"
-                "• Contarme de un partido (audio o texto)\n"
+                "• Contarme de un partido o un entrenamiento (audio o texto)\n"
                 "• _\"cómo voy\"_ — tu nivel y progreso\n"
                 "• _\"mis partidos\"_ — historial\n"
-                "• _\"último análisis\"_ — resumen del partido anterior\n"
-                "• _\"nuevo partido\"_ — empezar registro",
+                "• _\"último análisis\"_ — resumen de la sesión anterior\n"
+                "• _\"nuevo partido\"_ / _\"nuevo entrenamiento\"_ — empezar registro",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
         # intent == "partido" — continúa a extracción
 
     # Extracción de datos del partido
-    extraido = extraer_datos_claude(texto, session["draft"], session.get("historial", []))
+    # Tipo de sesión: keywords obvias primero; si son ambiguas, decide Claude
+    # dentro de extraer_datos_claude() y lo devuelve en la clave "tipo_sesion".
+    tipo_sesion = session.get("tipo_sesion") or detectar_tipo_sesion(texto)
+    log.info(f"tipo_sesion por keywords/sesión = {tipo_sesion}")
+
+    # El historial que sirve de baseline es el del mismo tipo de sesión
+    historial_ctx = session.get("historial", [])
+    if tipo_sesion:
+        historial_ctx = [p for p in historial_ctx
+                         if normalizar_tipo(p.get("tipo_sesion")) == tipo_sesion]
+
+    extraido = extraer_datos_claude(texto, session["draft"], historial_ctx, tipo_sesion)
+    tipo_claude = extraido.pop("tipo_sesion", None) if extraido else None
+    if tipo_sesion is None and tipo_claude in TIPOS_SESION:
+        tipo_sesion = tipo_claude
+        log.info(f"tipo_sesion desempatado por Claude = {tipo_sesion}")
+
+    era_conocido = bool(session.get("tipo_sesion"))
+    session["tipo_sesion"] = normalizar_tipo(tipo_sesion)
     log.info(f"extraido keys={list(extraido.keys()) if extraido else 'vacío'}")
 
     if extraido:
@@ -1332,12 +1633,21 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
             chat_id,
             f"✅ Entendido. Guardé: {campos_guardados}",
         )
+        # Avisar del tipo detectado una sola vez, con opción de corregirlo
+        if not era_conocido:
+            await context.bot.send_message(
+                chat_id,
+                f"📌 Lo estoy registrando como *{etiqueta_tipo(session['tipo_sesion'])}*.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=teclado_cambiar_tipo(session["tipo_sesion"])
+            )
     else:
         await context.bot.send_message(
             chat_id,
-            "🤔 No pude entender eso como datos de un partido.\n\n"
-            "Cuéntame cómo les fue — por ejemplo:\n"
-            "_\"Ganamos 6-4 6-2 contra rivales de 4ta, el saque estuvo bien pero cometimos errores en la red\"_\n\n"
+            "🤔 No pude entender eso como datos de un partido ni de un entrenamiento.\n\n"
+            "Cuéntame cómo te fue — por ejemplo:\n"
+            "_\"Ganamos 6-4 6-2 contra rivales de 4ta, el saque estuvo bien pero cometimos errores en la red\"_\n"
+            "_\"Entrené una hora de bandeja con el profe, salió mejor que la vez pasada\"_\n\n"
             "O si quieres hacer otra cosa:\n"
             "• _\"cómo voy\"_ · _\"mis partidos\"_ · _\"último análisis\"_ · _\"ayuda\"_",
             parse_mode=ParseMode.MARKDOWN
@@ -1583,18 +1893,23 @@ async def cmd_nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id  = update.effective_user.id
     chat_id  = update.effective_chat.id
-    historial = obtener_historial(user_id, limite=5)
+    # /nuevo entrenamiento — o /nuevo a secas y lo deduce del primer mensaje
+    arg        = " ".join(context.args or [])
+    tipo_nuevo = detectar_tipo_sesion(arg) if arg else None
+    historial  = obtener_historial(user_id, limite=5)
     sessions[chat_id] = {
         "draft": {}, "step": "waiting_input",
         "pending_field": None, "historial": historial,
+        "tipo_sesion": tipo_nuevo,
     }
     hist_msg = ""
     if historial:
         n = len(historial)
-        hist_msg = (f"\n📚 _Cargué tu historial de {n} partido{'s' if n>1 else ''} anterior{'es' if n>1 else ''}. "
+        hist_msg = (f"\n📚 _Cargué tu historial de {n} sesión{'es' if n>1 else ''} anterior{'es' if n>1 else ''}. "
                    f"Puedes decirme cosas como \"igual que siempre\" o \"todo bien menos el saque\"._")
+    que = etiqueta_tipo(tipo_nuevo) if tipo_nuevo else "partido o entrenamiento"
     await update.message.reply_text(
-        f"✅ Listo. Cuéntame del partido.{hist_msg}",
+        f"✅ Listo. Cuéntame del {que}.{hist_msg}",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -1765,13 +2080,13 @@ async def cmd_historial_chat(chat_id: int, user_id: int, context: ContextTypes.D
     """Versión de cmd_historial invocable desde texto libre."""
     partidos = obtener_historial(user_id, limite=5)
     if not partidos:
-        await context.bot.send_message(chat_id, "Sin partidos registrados aún.")
+        await context.bot.send_message(chat_id, "Sin sesiones registradas aún.")
         return
-    lines = ["*Últimos partidos:*\n"]
+    lines = ["*Últimas sesiones:*\n"]
     for p in partidos:
         fecha = str(p.get("fecha", "?"))[:10]
         lines.append(
-            f"📅 {fecha} — {p.get('resultado','?')} · "
+            f"{icono_sesion(p)} {fecha} — {descriptor_sesion(p)} · "
             f"T:{p.get('score_tecnica','?')} "
             f"TÁC:{p.get('score_tactica','?')} "
             f"EM:{p.get('score_emocional','?')}"
@@ -1815,12 +2130,12 @@ async def cmd_resumen_chat(chat_id: int, user_id: int, context: ContextTypes.DEF
     """Versión de cmd_resumen invocable desde texto libre."""
     partidos = obtener_historial(user_id, limite=1)
     if not partidos:
-        await context.bot.send_message(chat_id, "Sin partidos registrados aún.")
+        await context.bot.send_message(chat_id, "Sin sesiones registradas aún.")
         return
     p       = partidos[0]
     analisis = json.loads(p.get("analisis_raw", "{}")) if isinstance(p.get("analisis_raw"), str) else (p.get("analisis_raw") or {})
     draft    = json.loads(p.get("datos_raw",    "{}")) if isinstance(p.get("datos_raw"),    str) else (p.get("datos_raw")    or {})
-    await enviar_analisis(chat_id, context, analisis, draft)
+    await enviar_analisis(chat_id, context, analisis, draft, p.get("tipo_sesion"))
 
 async def cmd_historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not autorizado(update.effective_user.id):
@@ -1828,13 +2143,13 @@ async def cmd_historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     partidos = obtener_historial(user_id, limite=5)
     if not partidos:
-        await update.message.reply_text("Sin partidos registrados aún.")
+        await update.message.reply_text("Sin sesiones registradas aún.")
         return
-    lines = ["*Últimos partidos:*\n"]
+    lines = ["*Últimas sesiones:*\n"]
     for p in partidos:
-        fecha = p.get("fecha","?")[:10]
+        fecha = str(p.get("fecha","?"))[:10]
         lines.append(
-            f"📅 {fecha} — {p.get('resultado','?')} · "
+            f"{icono_sesion(p)} {fecha} — {descriptor_sesion(p)} · "
             f"T:{p.get('score_tecnica','?')} TÁC:{p.get('score_tactica','?')} EM:{p.get('score_emocional','?')}"
         )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
@@ -1845,12 +2160,12 @@ async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     partidos = obtener_historial(user_id, limite=1)
     if not partidos:
-        await update.message.reply_text("Sin partidos registrados aún.")
+        await update.message.reply_text("Sin sesiones registradas aún.")
         return
     p = partidos[0]
-    analisis = json.loads(p.get("analisis_raw","{}"))
-    draft    = json.loads(p.get("datos_raw","{}"))
-    await enviar_analisis(update.effective_chat.id, context, analisis, draft)
+    analisis = json.loads(p.get("analisis_raw") or "{}") if isinstance(p.get("analisis_raw"), str) else (p.get("analisis_raw") or {})
+    draft    = json.loads(p.get("datos_raw")    or "{}") if isinstance(p.get("datos_raw"),    str) else (p.get("datos_raw")    or {})
+    await enviar_analisis(update.effective_chat.id, context, analisis, draft, p.get("tipo_sesion"))
 
 async def handle_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user    = update.effective_user
@@ -1928,7 +2243,7 @@ async def handle_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not autorizado(update.effective_user.id):
         return
     await update.message.reply_text(
-        "📸 Foto recibida. Por ahora analizo el partido con texto/audio. "
+        "📸 Foto recibida. Por ahora analizo partidos y entrenamientos con texto/audio. "
         "Si hay un marcador en la foto, escríbelo manualmente: ej. _6-4 / 4-6_",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -1960,6 +2275,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "step":          "waiting_input",
             "pending_field": None,
             "historial":     historial,
+            "tipo_sesion":   TIPO_PARTIDO,
         }
         await query.edit_message_text(
             f"✅ Partido cargado:\n"
@@ -1969,6 +2285,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Audio o texto, como prefieras.",
             parse_mode=ParseMode.MARKDOWN
         )
+        return
+
+    # ── set_tipo|<tipo> — el usuario corrige partido ↔ entrenamiento ──────
+    if data.startswith("set_tipo|"):
+        _, nuevo_tipo = data.split("|", 1)
+        nuevo_tipo    = normalizar_tipo(nuevo_tipo)
+        session["tipo_sesion"] = nuevo_tipo
+        # Los campos del otro tipo dejan de aplicar
+        validos = set(campos_de(nuevo_tipo)) | set(campos_opcionales_de(nuevo_tipo))
+        session["draft"] = {k: v for k, v in session.get("draft", {}).items() if k in validos}
+        session["pending_field"] = None
+        session["step"] = "waiting_input"
+        await query.edit_message_text(
+            f"↔️ Corregido: lo registro como *{etiqueta_tipo(nuevo_tipo)}*.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        faltan = await pedir_siguiente_campo(chat_id, context, session)
+        if not faltan:
+            await mostrar_resumen_y_confirmar(chat_id, context, session)
         return
 
     # ── partner_no — partner rechaza el partido ───────────────────────────
@@ -2035,7 +2370,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, campo = data.split("|", 1)
         session["pending_field"] = campo
         session["step"] = "waiting_manual"
-        etiqueta = CAMPOS.get(campo, CAMPOS_OPCIONALES.get(campo, campo))
+        tipo     = normalizar_tipo(session.get("tipo_sesion"))
+        etiqueta = campos_de(tipo).get(campo, campos_opcionales_de(tipo).get(campo, campo))
         await query.edit_message_text(
             f"✏️ Escribe el valor para: *{etiqueta}*",
             parse_mode=ParseMode.MARKDOWN
@@ -2043,46 +2379,53 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── analizar ─────────────────────────────────────────────────────────────
     elif data == "analizar":
-        await query.edit_message_text("⏳ Calculando tu nivel y analizando el partido…")
+        tipo = normalizar_tipo(session.get("tipo_sesion"))
+        await query.edit_message_text(f"⏳ Calculando tu nivel y analizando el {etiqueta_tipo(tipo)}…")
         draft     = session["draft"]
-        historial = obtener_historial(user.id, limite=10)
+        historial = obtener_historial(user.id, limite=10, tipo_sesion=tipo)
         perfil    = obtener_perfil(user.id)
 
-        # 1. Inferir nivel anclado en el perfil
+        # 1. Inferir nivel anclado en el perfil (sólo mira partidos)
+        hist_partidos = (historial if tipo == TIPO_PARTIDO
+                         else obtener_historial(user.id, limite=10, tipo_sesion=TIPO_PARTIDO))
         try:
-            nivel_inferido = inferir_nivel_claude(historial, perfil)
+            nivel_inferido = inferir_nivel_claude(hist_partidos, perfil)
         except Exception as e:
             log.error(f"Error inferencia nivel: {e}")
             nivel_inferido = (perfil or {}).get("nivel_actual", "5ta alta")
 
         # 2. Generar análisis
         try:
-            analysis = analizar_con_claude(draft, historial, nivel_inferido)
+            analysis = analizar_con_claude(draft, historial, nivel_inferido, tipo)
         except Exception as e:
             log.error(f"Error Claude análisis: {e}")
             await context.bot.send_message(chat_id, f"❌ Error en el análisis: {e}")
             return
 
-        # 3. Guardar partido
+        # 3. Guardar la sesión
         try:
-            guardar_partido(user.id, user.username or str(user.id), draft, analysis, nivel_inferido)
-            await context.bot.send_message(chat_id, "💾 _Partido guardado en base de datos._", parse_mode=ParseMode.MARKDOWN)
+            guardar_sesion(user.id, user.username or str(user.id), draft, analysis,
+                           nivel_inferido, tipo)
+            await context.bot.send_message(
+                chat_id,
+                f"💾 _{etiqueta_tipo(tipo).capitalize()} guardado en base de datos._",
+                parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             log.error(f"Error Supabase partidos: {e}")
             await context.bot.send_message(chat_id, f"⚠️ Análisis listo pero *no se guardó* en la base de datos.\nError: `{e}`", parse_mode=ParseMode.MARKDOWN)
 
-        # 4. Actualizar nivel en perfil del jugador
-        try:
-            actualizar_nivel_jugador(user.id, nivel_inferido)
-        except Exception as e:
-            log.error(f"Error actualizando perfil: {e}")
+        # 4. Actualizar nivel en perfil del jugador — sólo los partidos cuentan
+        if tipo == TIPO_PARTIDO:
+            try:
+                actualizar_nivel_jugador(user.id, nivel_inferido)
+            except Exception as e:
+                log.error(f"Error actualizando perfil: {e}")
 
-        texto = formatear_analisis(analysis, draft)
-        await enviar_analisis(chat_id, context, analysis, draft)
+        await enviar_analisis(chat_id, context, analysis, draft, tipo)
 
-        # 5. Detectar y notificar partner si fue mencionado
+        # 5. Detectar y notificar partner si fue mencionado (sólo en partidos)
         texto_original = session.get("texto_original", "")
-        partner_query  = detectar_partner_en_texto(texto_original)
+        partner_query  = detectar_partner_en_texto(texto_original) if tipo == TIPO_PARTIDO else None
         if partner_query:
             partner = buscar_jugador_por_nombre_o_username(partner_query)
             if partner and str(partner.get("user_id")) != str(user.id):
@@ -2105,7 +2448,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id,
             "💬 *¿Querés agregar algo más?* (opcional)\n"
             "Podés contarme sobre errores específicos, momentos emocionales clave, "
-            "o cualquier detalle del partido. También podés escribir /nuevo para el próximo.",
+            "o cualquier detalle de la sesión. También podés escribir /nuevo para la próxima.",
             parse_mode=ParseMode.MARKDOWN
         )
         sessions.pop(chat_id, None)
