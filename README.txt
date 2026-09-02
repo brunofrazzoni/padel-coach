@@ -97,6 +97,48 @@ Bot:
   → Te manda el análisis formateado
 ```
 
+También funciona con entrenamientos:
+
+```
+  → "Entrené una hora de bandeja con el profe, salió mejor que la vez pasada"
+  → El bot lo detecta como entrenamiento y pregunta foco e intensidad
+    en vez de resultado y rivales
+```
+
+---
+
+## Partidos vs entrenamientos
+
+El bot distingue solo si le cuentas un **partido** o un **entrenamiento**, en dos pasos:
+
+1. **Keywords obvias** (`detectar_tipo_sesion()` en `bot.py`) — un marcador, "ganamos",
+   "rivales" o "torneo" marcan partido; "clase", "drills", "profe" o "canasta" marcan
+   entrenamiento. Resuelve la mayoría de los casos sin costo.
+2. **Claude como desempate** — si el texto es ambiguo o mezcla señales, la clasificación
+   viaja dentro de la misma llamada de extracción (`extraer_datos_claude()`), que devuelve
+   la clave `tipo_sesion`. No hay llamada extra a la API.
+
+Tras la primera extracción el bot avisa qué detectó y ofrece un botón para corregirlo.
+
+Diferencias por tipo:
+
+| | Partido | Entrenamiento |
+|---|---|---|
+| Campos mínimos | resultado, nivel de rivales | tipo de sesión, foco |
+| Campos propios | gestión del marcador, ansiedad pre-partido | intensidad, ejercicio difícil, aprendizaje |
+| Score emocional | (10−ansiedad) + foco + errores + comunicación | foco + errores + comunicación |
+| Sube/baja de nivel | sí | no — no es evidencia competitiva |
+| Notifica a la pareja | sí | no |
+
+Ambos tipos viven en la tabla `partidos`, separados por la columna `tipo_sesion`.
+Las filas anteriores a este cambio quedan marcadas como `partido`.
+
+Prueba de las funciones puras (sin red ni API keys):
+
+```
+python test_tipo_sesion.py
+```
+
 ---
 
 ## Comandos disponibles
@@ -104,9 +146,9 @@ Bot:
 | Comando | Qué hace |
 |---|---|
 | `/start` | Bienvenida e instrucciones |
-| `/nuevo` | Reinicia la sesión actual |
+| `/nuevo` | Reinicia la sesión actual (acepta `/nuevo entrenamiento`) |
 | `/resumen` | Muestra el último análisis guardado |
-| `/historial` | Lista los últimos 5 partidos con scores |
+| `/historial` | Lista las últimas 5 sesiones con scores |
 | `/borrar` | Borra la sesión actual sin guardar |
 
 ---
