@@ -123,5 +123,87 @@ kb3 = bot.teclado_tipo_entrenamiento()
 check("teclado tipo entrenamiento: 5 opciones + Otro",
       sum(len(f) for f in kb3.inline_keyboard), 6)
 
+print("\n== router: fast path por coincidencia exacta ==")
+check("'Hola!' normaliza y matchea",     bot.intent_exacto("Hola!"),  ("saludo", None))
+check("'  cómo voy  ' matchea",          bot.intent_exacto("  cómo voy  "), ("minivel", None))
+check("'nuevo entrenamiento' trae tipo", bot.intent_exacto("nuevo entrenamiento"),
+      ("nuevo", bot.TIPO_ENTRENAMIENTO))
+check("'hola, ganamos 6-4' NO es exacto", bot.intent_exacto("hola, ganamos 6-4"), None)
+check("'cómo voy con la bandeja' NO es exacto",
+      bot.intent_exacto("cómo voy con la bandeja"), None)
+
+
+class RespuestaFalsa:
+    """Imita la forma de una respuesta de la Messages API."""
+    def __init__(self, texto):
+        self.content = [types.SimpleNamespace(text=texto)]
+
+
+class ClaudeFalso:
+    """Cuenta llamadas y devuelve (o lanza) lo que se le indique."""
+    def __init__(self, devuelve=None, lanza=None):
+        self.devuelve, self.lanza, self.llamadas = devuelve, lanza, 0
+        self.messages = types.SimpleNamespace(create=self._create)
+
+    def _create(self, **kw):
+        self.llamadas += 1
+        self.modelo = kw.get("model")
+        if self.lanza:
+            raise self.lanza
+        return RespuestaFalsa(self.devuelve)
+
+
+def con_claude(falso, *args, **kwargs):
+    original = bot.claude
+    bot.claude = falso
+    try:
+        return bot.clasificar_mensaje(*args, **kwargs)
+    finally:
+        bot.claude = original
+
+
+print("\n== router: no gasta API en el fast path ==")
+f = ClaudeFalso(devuelve='{"intent":"reporte","tipo_sesion":null}')
+r = con_claude(f, "hola")
+check("'hola' se resuelve sin llamar a la API", (r["intent"], r["via"], f.llamadas),
+      ("saludo", "exacto", 0))
+
+print("\n== router: los casos que rompían los keywords ==")
+f = ClaudeFalso(devuelve='{"intent": "reporte", "tipo_sesion": "partido"}')
+r = con_claude(f, "hola, ganamos 6-4 6-2 contra los de 4ta")
+check("saludo + reporte pegado -> reporte",
+      (r["intent"], r["tipo_sesion"], r["via"]), ("reporte", "partido", "claude"))
+check("usa el modelo router", f.modelo, bot.MODELO_ROUTER)
+
+f = ClaudeFalso(devuelve='```json\n{"intent": "consulta_tecnica", "tipo_sesion": null}\n```')
+r = con_claude(f, "cómo voy con la bandeja, siento que no mejoro")
+check("JSON envuelto en markdown se parsea",
+      (r["intent"], r["tipo_sesion"]), ("consulta_tecnica", None))
+
+print("\n== router: respaldo cuando el modelo falla ==")
+f = ClaudeFalso(lanza=RuntimeError("503 upstream"))
+r = con_claude(f, "ganamos 6-3 6-4, el saque muy bien")
+check("excepción -> keywords, sin romper",
+      (r["intent"], r["tipo_sesion"], r["via"]), ("reporte", "partido", "fallback"))
+
+f = ClaudeFalso(devuelve='{"intent": "chachacha", "tipo_sesion": "partido"}')
+r = con_claude(f, "entrené drills de volea con el profe")
+check("intent inválido -> keywords",
+      (r["intent"], r["tipo_sesion"], r["via"]), ("reporte", "entrenamiento", "fallback"))
+
+f = ClaudeFalso(devuelve='no soy json')
+r = con_claude(f, "hola qué tal todo bien")
+check("respuesta no-JSON -> keywords", r["via"], "fallback")
+
+f = ClaudeFalso(devuelve='{"intent": "reporte", "tipo_sesion": "basura"}')
+r = con_claude(f, "jugamos ayer")
+check("tipo_sesion inválido se descarta",
+      (r["intent"], r["tipo_sesion"]), ("reporte", None))
+
+print("\n== router: contexto de borrador en curso ==")
+f = ClaudeFalso(devuelve='{"intent": "reporte", "tipo_sesion": null}')
+r = con_claude(f, "el saque fue 8", {"resultado": "6-4"}, bot.TIPO_PARTIDO)
+check("corrección con draft abierto -> reporte", r["intent"], "reporte")
+
 print("\n" + ("TODO OK" if not fallos else "FALLOS:\n" + "\n".join(fallos)))
 sys.exit(1 if fallos else 0)

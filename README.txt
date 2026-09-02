@@ -107,16 +107,44 @@ También funciona con entrenamientos:
 
 ---
 
+## Cómo entiende el bot lo que le escribes
+
+El ruteo de mensajes es **semántico**, no por keywords. `clasificar_mensaje()` en
+`bot.py` decide en una sola llamada qué quiere el jugador y, si está reportando una
+sesión, de qué tipo es.
+
+Antes el ruteo era puramente por keywords y fallaba en dos patrones muy frecuentes:
+
+- **Saludo con reporte pegado.** `detectar_intent()` matcheaba por prefijo, así que
+  "hola, ganamos 6-4" se clasificaba como saludo y **el reporte se perdía entero**.
+- **Audio transcrito sin signos de pregunta.** Whisper rara vez escribe "?", y la regla
+  para consultas técnicas lo exigía. "Me gustaría saber cómo mejorar mi salida de pared"
+  caía a reporte y el bot le buscaba un marcador.
+
+Contra 16 frases realistas, el ruteo por keywords fallaba 9.
+
+El router mantiene un **fast path gratis** para coincidencias exactas ("hola",
+"mis partidos", "cómo voy" a secas), que es donde los keywords nunca se equivocan.
+Todo lo demás va al modelo.
+
+| | Camino | Costo |
+|---|---|---|
+| Frase exacta | tabla `FRASES_EXACTAS` | $0, sin latencia |
+| Cualquier otra cosa | `MODELO_ROUTER` (Haiku 4.5) | ~$0.0005/mensaje |
+| Si la llamada falla | `detectar_intent()` + `detectar_tipo_sesion()` | $0 |
+
+El respaldo por keywords se conserva a propósito: un fallo del clasificador nunca debe
+hacer que se pierda el mensaje del jugador, aunque el ruteo salga peor.
+
+**Modelos:** el router usa `claude-haiku-4-5` porque clasificar es corto y frecuente.
+La extracción y el análisis siguen en Sonnet — ahí es donde está el valor.
+
 ## Partidos vs entrenamientos
 
-El bot distingue solo si le cuentas un **partido** o un **entrenamiento**, en dos pasos:
-
-1. **Keywords obvias** (`detectar_tipo_sesion()` en `bot.py`) — un marcador, "ganamos",
-   "rivales" o "torneo" marcan partido; "clase", "drills", "profe" o "canasta" marcan
-   entrenamiento. Resuelve la mayoría de los casos sin costo.
-2. **Claude como desempate** — si el texto es ambiguo o mezcla señales, la clasificación
-   viaja dentro de la misma llamada de extracción (`extraer_datos_claude()`), que devuelve
-   la clave `tipo_sesion`. No hay llamada extra a la API.
+Si el router no logra decidir el tipo (un texto mixto como "entrenamos y después
+jugamos un partido"), queda una última red: la clasificación viaja dentro de la misma
+llamada de extracción (`extraer_datos_claude()`), que devuelve la clave `tipo_sesion`
+junto con los datos. Eso no agrega llamadas a la API.
 
 Tras la primera extracción el bot avisa qué detectó y ofrece un botón para corregirlo.
 

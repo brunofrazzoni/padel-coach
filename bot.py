@@ -31,6 +31,10 @@ claude    = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 groq      = Groq(api_key=os.environ["GROQ_API_KEY"])
 supabase  = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
+# Modelo del router de intenciones: clasificar es una tarea corta y frecuente,
+# así que va en el modelo más rápido y barato. El análisis sigue en Sonnet.
+MODELO_ROUTER = "claude-haiku-4-5"
+
 INVITE_CODE  = os.environ.get("INVITE_CODE", "padel2024")
 ADMIN_IDS    = set(int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip())
 
@@ -1219,7 +1223,12 @@ def detectar_tipo_sesion(texto: str) -> str | None:
 
 
 def detectar_intent(texto: str) -> str:
-    """Detecta si el usuario está pidiendo algo del sistema o reportando un partido."""
+    """
+    Ruteo por keywords. Ya NO es el camino principal — quedó como red de
+    seguridad de clasificar_mensaje() cuando la llamada al modelo falla.
+    Es frágil por diseño: matchea por prefijo y substring, así que confunde
+    "hola, ganamos 6-4" con un saludo. Ver clasificar_mensaje().
+    """
     t = texto.lower().strip()
 
     saludos = ["hola", "buenas", "buen día", "buen dia", "buenos días", "buenos dias",
@@ -1276,7 +1285,140 @@ def detectar_intent(texto: str) -> str:
             if t == kw or t == f"la {kw}" or t == f"el {kw}" or t == f"la {kw}?" or t == f"el {kw}?":
                 return "consulta_tecnica"
 
-    return "partido"
+    return "reporte"
+
+# ── ROUTER DE INTENCIONES ─────────────────────────────────────────────────────
+# El ruteo por keywords fallaba en dos patrones frecuentes:
+#   1. Saludo con reporte pegado — "hola, ganamos 6-4" se clasificaba como
+#      saludo y el reporte se perdía entero.
+#   2. Audio transcrito sin signos de pregunta — Whisper rara vez escribe "?",
+#      así que las consultas técnicas largas caían a reporte.
+# Los keywords sólo son confiables en coincidencia EXACTA, que es donde se
+# quedaron: el resto lo clasifica el modelo.
+
+INTENTS_VALIDOS = {"saludo", "historial", "minivel", "resumen",
+                   "nuevo", "ayuda", "consulta_tecnica", "reporte"}
+
+# Frases que por sí solas no admiten otra lectura. Valor: (intent, tipo_sesion)
+FRASES_EXACTAS = {}
+for _frases, _intent, _tipo in [
+    (["hola", "hola!", "buenas", "buenos días", "buenos dias", "buen día", "buen dia",
+      "buenas tardes", "buenas noches", "hey", "hi", "hello", "qué tal", "que tal"],
+     "saludo", None),
+    (["historial", "mis partidos", "mis entrenamientos", "mis sesiones",
+      "últimos partidos", "ultimos partidos", "partidos anteriores"],
+     "historial", None),
+    (["mi nivel", "cómo voy", "como voy", "qué nivel", "que nivel",
+      "mi progreso", "progreso"],
+     "minivel", None),
+    (["resumen", "último análisis", "ultimo analisis", "mi análisis", "mi analisis"],
+     "resumen", None),
+    (["nuevo partido", "partido nuevo", "registrar partido"],
+     "nuevo", TIPO_PARTIDO),
+    (["nuevo entrenamiento", "entrenamiento nuevo", "registrar entrenamiento"],
+     "nuevo", TIPO_ENTRENAMIENTO),
+    (["nuevo", "empezar de nuevo"], "nuevo", None),
+    (["ayuda", "comandos", "help", "qué puedes hacer", "que puedes hacer",
+      "cómo funciona", "como funciona"],
+     "ayuda", None),
+]:
+    for _f in _frases:
+        FRASES_EXACTAS[_f] = (_intent, _tipo)
+
+
+def _normalizar(texto: str) -> str:
+    """Minúsculas, sin puntuación de borde y con espacios colapsados."""
+    return " ".join(texto.lower().strip().strip("¿?¡!.,;:…").split())
+
+
+def intent_exacto(texto: str) -> tuple | None:
+    """Fast path sin costo: sólo coincidencia exacta, donde los keywords no fallan."""
+    return FRASES_EXACTAS.get(_normalizar(texto))
+
+
+def clasificar_mensaje(texto: str, draft_actual: dict = None,
+                       tipo_en_curso=None) -> dict:
+    """
+    Clasifica el mensaje en una intención y, si es un reporte, en un tipo de sesión.
+
+    Devuelve {"intent": str, "tipo_sesion": str|None, "via": str}. La clave "via"
+    dice de dónde salió la decisión ("exacto", "claude", "fallback") y sólo se usa
+    para logs.
+    """
+    exacto = intent_exacto(texto)
+    if exacto:
+        intent, tipo = exacto
+        return {"intent": intent, "tipo_sesion": tipo, "via": "exacto"}
+
+    if draft_actual:
+        ctx_draft = (
+            f"\n- El jugador YA está registrando una sesión"
+            f"{' de tipo ' + normalizar_tipo(tipo_en_curso) if tipo_en_curso else ''}"
+            f" y lleva estos campos: {', '.join(draft_actual.keys())}.\n"
+            f"  Un dato suelto o una corrección (\"el saque fue 8\", \"en realidad "
+            f"perdimos\") es \"reporte\", no otra cosa."
+        )
+    else:
+        ctx_draft = ""
+
+    prompt = f"""Eres el router de intenciones de un bot de pádel por Telegram. Clasifica el mensaje del jugador en UNA sola intención.
+
+INTENCIONES:
+- "saludo": sólo saluda, sin contarte nada ni pedirte nada más.
+- "reporte": te cuenta cómo le fue en una sesión — un partido o un entrenamiento — o te da datos sueltos sobre ella.
+- "consulta_tecnica": pregunta sobre pádel — técnica, táctica, reglas, cómo mejorar un golpe o un concepto del juego.
+- "historial": pide ver sus sesiones pasadas.
+- "minivel": pregunta por SU nivel, categoría o progreso general como jugador.
+- "resumen": pide el último análisis que le diste.
+- "nuevo": quiere empezar a registrar una sesión, pero todavía no la cuenta.
+- "ayuda": pregunta qué puedes hacer o cómo funcionas.
+
+REGLAS CRÍTICAS:
+- Un saludo SEGUIDO de contenido NO es "saludo". "Hola, ganamos 6-4" es "reporte" y "buenas, cómo pego la bandeja" es "consulta_tecnica". Clasifica por lo que el jugador quiere, no por cómo empieza el mensaje.
+- Los mensajes suelen venir de audio transcrito y NO traen signos de pregunta. "Cómo mejoro la bandeja" es "consulta_tecnica" aunque no lleve "?".
+- Distingue "cómo voy" (minivel: su progreso general) de "cómo voy con la bandeja" (consulta_tecnica: sobre un golpe).
+- "cuántos partidos necesito para subir de categoría" es "consulta_tecnica", no "historial": pregunta por un criterio, no por su lista.
+- "nuevo" es sólo cuando anuncia que va a registrar algo SIN contarlo todavía. Si ya está contando, es "reporte".{ctx_draft}
+
+Si la intención es "reporte" o "nuevo", agrega también "tipo_sesion":
+- "partido": hubo competencia real — marcador, rivales, torneo, americano, sets.
+- "entrenamiento": clase, drills, sparring, canasta, ejercicios, práctica libre.
+- null: todavía no se puede saber.
+En cualquier otra intención, "tipo_sesion" es null.
+
+MENSAJE DEL JUGADOR:
+"{texto}"
+
+Responde SOLO con este JSON, sin markdown:
+{{"intent": "<una de las 8>", "tipo_sesion": "partido"|"entrenamiento"|null}}"""
+
+    try:
+        resp = claude.messages.create(
+            model=MODELO_ROUTER,
+            max_tokens=60,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw    = resp.content[0].text.strip()
+        clean  = re.sub(r"```json|```", "", raw).strip()
+        datos  = json.loads(clean)
+        intent = datos.get("intent")
+        if intent not in INTENTS_VALIDOS:
+            raise ValueError(f"intent desconocido: {intent!r}")
+        tipo = datos.get("tipo_sesion")
+        return {
+            "intent": intent,
+            "tipo_sesion": tipo if tipo in TIPOS_SESION else None,
+            "via": "claude",
+        }
+    except Exception as e:
+        # Nunca dejar caer el mensaje del usuario por un fallo del clasificador
+        log.error(f"clasificar_mensaje falló ({e}) — uso keywords como respaldo")
+        return {
+            "intent": detectar_intent(texto),
+            "tipo_sesion": detectar_tipo_sesion(texto),
+            "via": "fallback",
+        }
+
 
 def detectar_partner_en_texto(texto: str) -> str | None:
     """Extrae mención de pareja del texto del usuario."""
@@ -1484,20 +1626,34 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
     if not session.get("texto_original"):
         session["texto_original"] = texto
 
-    # Extracción con historial como contexto
-    # Pero primero — detectar si el usuario está pidiendo algo del sistema
-    if session.get("step") == "waiting_input":
-        intent = detectar_intent(texto)
+    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    # Normalizar step
+    step_actual = session.get("step") or "waiting_input"
+    log.info(f"step_actual='{step_actual}' ejecutando intent/extracción")
+
+    # ── Ruteo semántico ──────────────────────────────────────────────────────
+    # Una sola llamada decide intención y, si es un reporte, tipo de sesión.
+    if step_actual == "waiting_input":
+        rut    = clasificar_mensaje(texto, session.get("draft"), session.get("tipo_sesion"))
+        intent = rut["intent"]
+        log.info(f"intent='{intent}' tipo='{rut['tipo_sesion']}' via={rut['via']}")
+
+        # El router ya vio de qué tipo es: se lo pasamos a la extracción
+        if rut["tipo_sesion"] and not session.get("tipo_sesion"):
+            session["tipo_sesion"] = rut["tipo_sesion"]
+
         if intent == "saludo":
             perfil   = obtener_perfil(user_id)
-            nivel    = perfil.get("nivel_actual", "—") if perfil else "—"
-            partidos = perfil.get("partidos_total", 0) if perfil else 0
+            nivel    = (perfil or {}).get("nivel_actual", "—")
+            partidos = (perfil or {}).get("partidos_total", 0)
             hist_tip = " Puedes decirme cosas como _\"igual que siempre pero con más errores en la red\"_." if partidos > 0 else ""
             await context.bot.send_message(
                 chat_id,
                 f"👋 ¡Hola! Soy tu coach de pádel.\n\n"
                 f"📊 Nivel actual: *{nivel}* · Partidos registrados: *{partidos}*\n\n"
-                f"Cuando termines un partido cuéntame cómo les fue — por audio o texto.{hist_tip}\n\n"
+                f"Cuando termines un partido o un entrenamiento cuéntame cómo te fue — "
+                f"por audio o texto.{hist_tip}\n\n"
                 f"También puedes preguntarme:\n"
                 f"• _\"cómo voy\"_ — tu nivel y progreso\n"
                 f"• _\"mis partidos\"_ — historial\n"
@@ -1519,13 +1675,14 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
             return
         elif intent == "nuevo":
             historial = obtener_historial(user_id, limite=5)
-            tipo_nuevo = detectar_tipo_sesion(texto)
             sessions[chat_id] = {
-                "draft": {}, "step": "waiting_input",
-                "pending_field": None, "historial": historial,
-                "tipo_sesion": tipo_nuevo,
+                "draft": {}, "step": "waiting_input", "pending_field": None,
+                "historial": historial,
+                "tipo_sesion": rut["tipo_sesion"],
+                # Si el jugador nombró el tipo, no hace falta avisárselo después
+                "tipo_confirmado": bool(rut["tipo_sesion"]),
             }
-            que = etiqueta_tipo(tipo_nuevo) if tipo_nuevo else "partido o entrenamiento"
+            que = etiqueta_tipo(rut["tipo_sesion"]) if rut["tipo_sesion"] else "partido o entrenamiento"
             await context.bot.send_message(chat_id, f"✅ Listo. Cuéntame del {que}.")
             return
         elif intent == "ayuda":
@@ -1543,66 +1700,7 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
                 parse_mode=ParseMode.MARKDOWN
             )
             return
-
-    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-
-    # Normalizar step
-    step_actual = session.get("step") or "waiting_input"
-    log.info(f"step_actual='{step_actual}' ejecutando intent/extracción")
-
-    # Detectar intent si estamos listos para recibir partido
-    if step_actual == "waiting_input":
-        intent = detectar_intent(texto)
-        log.info(f"intent='{intent}'")
-
-        if intent == "saludo":
-            perfil   = obtener_perfil(user_id)
-            nivel    = (perfil or {}).get("nivel_actual", "—")
-            partidos = (perfil or {}).get("partidos_total", 0)
-            hist_tip = " Puedes decirme cosas como _\"igual que siempre pero con más errores en la red\"_." if partidos > 0 else ""
-            await context.bot.send_message(
-                chat_id,
-                f"👋 ¡Hola! Soy tu coach de pádel.\n\n"
-                f"📊 Nivel actual: *{nivel}* · Partidos registrados: *{partidos}*\n\n"
-                f"Cuando termines un partido cuéntame cómo les fue.{hist_tip}\n\n"
-                f"También puedes preguntarme:\n"
-                f"• _\"cómo voy\"_ · _\"mis partidos\"_ · _\"último análisis\"_",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        elif intent == "consulta_tecnica":
-            await responder_consulta_tecnica(chat_id, user_id, texto, context)
-            return
-        elif intent == "historial":
-            await cmd_historial_chat(chat_id, user_id, context)
-            return
-        elif intent == "minivel":
-            await cmd_minivel_chat(chat_id, user_id, context)
-            return
-        elif intent == "resumen":
-            await cmd_resumen_chat(chat_id, user_id, context)
-            return
-        elif intent == "nuevo":
-            historial  = obtener_historial(user_id, limite=5)
-            tipo_nuevo = detectar_tipo_sesion(texto)
-            sessions[chat_id] = {"draft": {}, "step": "waiting_input", "pending_field": None,
-                                 "historial": historial, "tipo_sesion": tipo_nuevo}
-            que = etiqueta_tipo(tipo_nuevo) if tipo_nuevo else "partido o entrenamiento"
-            await context.bot.send_message(chat_id, f"✅ Listo. Cuéntame del {que}.")
-            return
-        elif intent == "ayuda":
-            await context.bot.send_message(
-                chat_id,
-                "🎾 *Puedo ayudarte con:*\n\n"
-                "• Contarme de un partido o un entrenamiento (audio o texto)\n"
-                "• _\"cómo voy\"_ — tu nivel y progreso\n"
-                "• _\"mis partidos\"_ — historial\n"
-                "• _\"último análisis\"_ — resumen de la sesión anterior\n"
-                "• _\"nuevo partido\"_ / _\"nuevo entrenamiento\"_ — empezar registro",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        # intent == "partido" — continúa a extracción
+        # intent == "reporte" — continúa a extracción
 
     # Extracción de datos del partido
     # Tipo de sesión: keywords obvias primero; si son ambiguas, decide Claude
@@ -1622,8 +1720,9 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
         tipo_sesion = tipo_claude
         log.info(f"tipo_sesion desempatado por Claude = {tipo_sesion}")
 
-    era_conocido = bool(session.get("tipo_sesion"))
     session["tipo_sesion"] = normalizar_tipo(tipo_sesion)
+    # Avisar una sola vez, y sólo si el jugador no dijo él mismo de qué se trata
+    hay_que_avisar = not (session.get("tipo_confirmado") or session.get("tipo_avisado"))
     log.info(f"extraido keys={list(extraido.keys()) if extraido else 'vacío'}")
 
     if extraido:
@@ -1633,8 +1732,9 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
             chat_id,
             f"✅ Entendido. Guardé: {campos_guardados}",
         )
-        # Avisar del tipo detectado una sola vez, con opción de corregirlo
-        if not era_conocido:
+        # Avisar del tipo detectado, con opción de corregirlo
+        if hay_que_avisar:
+            session["tipo_avisado"] = True
             await context.bot.send_message(
                 chat_id,
                 f"📌 Lo estoy registrando como *{etiqueta_tipo(session['tipo_sesion'])}*.",
@@ -1901,6 +2001,7 @@ async def cmd_nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "draft": {}, "step": "waiting_input",
         "pending_field": None, "historial": historial,
         "tipo_sesion": tipo_nuevo,
+        "tipo_confirmado": bool(tipo_nuevo),
     }
     hist_msg = ""
     if historial:
@@ -2276,6 +2377,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "pending_field": None,
             "historial":     historial,
             "tipo_sesion":   TIPO_PARTIDO,
+            "tipo_confirmado": True,
         }
         await query.edit_message_text(
             f"✅ Partido cargado:\n"
@@ -2291,7 +2393,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("set_tipo|"):
         _, nuevo_tipo = data.split("|", 1)
         nuevo_tipo    = normalizar_tipo(nuevo_tipo)
-        session["tipo_sesion"] = nuevo_tipo
+        session["tipo_sesion"]     = nuevo_tipo
+        session["tipo_confirmado"] = True
         # Los campos del otro tipo dejan de aplicar
         validos = set(campos_de(nuevo_tipo)) | set(campos_opcionales_de(nuevo_tipo))
         session["draft"] = {k: v for k, v in session.get("draft", {}).items() if k in validos}
