@@ -16,7 +16,7 @@ from supabase import create_client
 load_dotenv()
 
 # ── VERSIÓN ────────────────────────────────────────────────────────────────────
-BOT_VERSION = "02/09/2026 10:00"  # última actualización
+BOT_VERSION = "08/09/2026 12:00"  # última actualización
 
 # ── LOGGING — formato enriquecido con función y línea ─────────────────────────
 logging.basicConfig(
@@ -2164,12 +2164,6 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🟢 Bot activo · v{BOT_VERSION}\n{db_status}",
         parse_mode=ParseMode.MARKDOWN
     )
-
-
-    if not autorizado(update.effective_user.id):
-        return
-    sessions[update.effective_chat.id] = {"draft": {}, "step": "waiting_input", "pending_field": None}
-    await update.message.reply_text("✅ Sesión reiniciada. Cuéntame del partido.")
 
 async def cmd_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not autorizado(update.effective_user.id):
