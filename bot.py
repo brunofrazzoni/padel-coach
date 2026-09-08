@@ -16,7 +16,7 @@ from supabase import create_client
 load_dotenv()
 
 # ── VERSIÓN ────────────────────────────────────────────────────────────────────
-BOT_VERSION = "02/09/2026 10:00"  # última actualización
+BOT_VERSION = "08/09/2026 17:45"  # última actualización
 
 # ── LOGGING — formato enriquecido con función y línea ─────────────────────────
 logging.basicConfig(
@@ -469,6 +469,32 @@ def get_session(chat_id: int) -> dict:
     if chat_id not in sessions:
         sessions[chat_id] = {"draft": {}, "step": "waiting_input", "pending_field": None}
     return sessions[chat_id]
+
+
+# ── MEMORIA CONVERSACIONAL ────────────────────────────────────────────────────
+# Sin esto cada mensaje se clasificaba aislado, así que un "¿y eso cómo lo
+# entreno?" llegaba al router como una pregunta suelta de cinco palabras. Vive en
+# `sessions`, que es memoria del proceso: un redeploy la borra, igual que ya
+# pasaba con los borradores a medio llenar.
+
+MAX_TURNOS_CONVERSACION = 8
+MAX_CHARS_TURNO         = 400
+
+
+def recordar_turno(session: dict, rol: str, texto: str) -> None:
+    """Agrega un turno a la memoria corta y descarta los más viejos."""
+    if not texto:
+        return
+    conv = session.setdefault("conversacion", [])
+    conv.append({"rol": rol, "texto": texto[:MAX_CHARS_TURNO]})
+    del conv[:-MAX_TURNOS_CONVERSACION]
+
+
+def render_conversacion(session: dict) -> str:
+    """Los turnos recientes en texto plano, listos para inyectar en un prompt."""
+    conv = session.get("conversacion") or []
+    etiquetas = {"usuario": "Jugador", "bot": "Tú"}
+    return "\n".join(f"{etiquetas.get(t['rol'], t['rol'])}: {t['texto']}" for t in conv)
 
 def teclado_confirmacion(campo: str, opciones: list[str]) -> InlineKeyboardMarkup:
     """Genera teclado inline con opciones para un campo."""
@@ -1221,8 +1247,9 @@ INTENTS = {
     "ver_nivel":               "Pregunta por su categoría actual y su progreso general.",
     "ver_ultimo_analisis":     "Pide que le repitas el último análisis.",
     "saludo":                  "Sólo saluda, sin contar ni pedir nada más.",
+    "charla":                  "Comenta cómo se siente, agradece, bromea o conversa sin pedir nada concreto.",
     "ayuda":                   "Pregunta qué puedes hacer o cómo funcionas.",
-    "fuera_de_alcance":        "No tiene que ver con pádel ni con lo que hace el bot.",
+    "fuera_de_alcance":        "No tiene que ver ni con pádel ni con él como jugador.",
 }
 
 # Las dos intenciones que abren un registro, con el tipo de sesión que implican
@@ -1255,13 +1282,27 @@ EJEMPLOS_ROUTER = [
     ("repíteme el análisis anterior",                              "ver_ultimo_analisis"),
     ("hola",                                                       "saludo"),
     ("qué puedes hacer",                                           "ayuda"),
+    ("vengo cansadísimo, no di una hoy",                           "charla"),
+    ("gracias crack, muy claro",                                   "charla"),
     ("cómo está el clima hoy",                                     "fuera_de_alcance"),
 ]
 
 
-def _prompt_router(texto: str, draft_actual: dict = None, tipo_en_curso=None) -> str:
+def _prompt_router(texto: str, draft_actual: dict = None, tipo_en_curso=None,
+                   conversacion: str = "") -> str:
     catalogo = "\n".join(f'- "{k}": {v}' for k, v in INTENTS.items())
     ejemplos = "\n".join(f'"{t}" -> {i}' for t, i in EJEMPLOS_ROUTER)
+
+    if conversacion:
+        bloque_conv = (
+            f"\nCONVERSACIÓN RECIENTE (lo último está abajo):\n{conversacion}\n\n"
+            f"Si el mensaje es un seguimiento de lo que acabas de responder — "
+            f"\"¿y eso cómo lo entreno?\", \"dale\", \"¿y qué más?\" — clasifícalo "
+            f"según el TEMA de esa respuesta, no como si viniera solo. Si aceptó algo "
+            f"que le ofreciste, la intención es la de eso que ofreciste."
+        )
+    else:
+        bloque_conv = ""
 
     if draft_actual:
         campos = ", ".join(draft_actual.keys()) or "ninguno todavía"
@@ -1278,6 +1319,7 @@ def _prompt_router(texto: str, draft_actual: dict = None, tipo_en_curso=None) ->
 INTENCIONES POSIBLES:
 {catalogo}
 {ctx}
+{bloque_conv}
 
 CÓMO DESAMBIGUAR:
 - Un saludo SEGUIDO de contenido NO es "saludo". Clasifica por lo que el jugador quiere, no por cómo empieza el mensaje.
@@ -1288,6 +1330,7 @@ CÓMO DESAMBIGUAR:
 - Historial vs progreso: "mis partidos" pide la lista -> ver_historial. "Me va mejor contra 4ta" pide una conclusión -> consulta_progreso.
 - Partido vs entrenamiento: si hubo competencia con marcador es partido, aunque haya empezado calentando. Si sólo hubo práctica sin resultado, es entrenamiento.
 - Si el jugador anuncia que va a registrar algo pero todavía no lo cuenta, igual usa "registrar_partido" o "registrar_entrenamiento".
+- Charla vs fuera_de_alcance: si habla de sí mismo, de cómo se siente o de su juego sin pedir nada concreto, es "charla". "fuera_de_alcance" es sólo para lo que no tiene que ver ni con él como jugador ni con pádel.
 - Si de verdad no encaja en ninguna, usa "fuera_de_alcance". No fuerces una intención de pádel sobre un mensaje que no lo es.
 
 EJEMPLOS:
@@ -1301,7 +1344,7 @@ Responde SOLO con este JSON, sin markdown:
 
 
 def clasificar_mensaje(texto: str, draft_actual: dict = None,
-                       tipo_en_curso=None) -> dict:
+                       tipo_en_curso=None, conversacion: str = "") -> dict:
     """
     Clasifica el mensaje en una de INTENTS.
 
@@ -1309,7 +1352,7 @@ def clasificar_mensaje(texto: str, draft_actual: dict = None,
     clasificador no pudo responder ni tras reintentar: ya no hay respaldo por
     keywords, así que el llamador tiene que pedirle al jugador que repita.
     """
-    prompt = _prompt_router(texto, draft_actual, tipo_en_curso)
+    prompt = _prompt_router(texto, draft_actual, tipo_en_curso, conversacion)
     ultimo = None
 
     for intento in (1, 2):
@@ -1392,7 +1435,7 @@ CATEGORIAS_CONSEJO = {
 
 
 async def responder_consejo(chat_id: int, user_id: int, texto: str, intent: str,
-                            context: ContextTypes.DEFAULT_TYPE):
+                            session: dict, context: ContextTypes.DEFAULT_TYPE):
     """Responde una consulta de pádel en la dimensión que eligió el router."""
     categoria, emoji, foco = CATEGORIAS_CONSEJO[intent]
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
@@ -1432,8 +1475,11 @@ async def responder_consejo(chat_id: int, user_id: int, texto: str, intent: str,
         "criterio de coach, sin inventar datos concretos ni citar fuentes."
     )
 
-    prompt = f"""Eres un coach de pádel respondiendo a un jugador de nivel {nivel}. Su consulta es de {categoria}: trata sobre {foco}.
+    conv = render_conversacion(session)
+    bloque_conv = f"\nCONVERSACIÓN RECIENTE (por si el mensaje es un seguimiento):\n{conv}\n" if conv else ""
 
+    prompt = f"""Eres un coach de pádel respondiendo a un jugador de nivel {nivel}. Su consulta es de {categoria}: trata sobre {foco}.
+{bloque_conv}
 CONSULTA DEL JUGADOR: "{texto}"
 
 {bloque_conocimiento}
@@ -1446,16 +1492,18 @@ Responde directo y accionable para su nivel. Máximo 3 párrafos cortos.
 - No inventes datos técnicos que no estén en el material provisto.
 - Tono cercano, de coach que lo conoce."""
 
-    resp = claude.messages.create(
+    resp      = claude.messages.create(
         model=MODELO_CONSEJO,
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}]
     )
-    await context.bot.send_message(chat_id, resp.content[0].text.strip(),
-                                   parse_mode=ParseMode.MARKDOWN)
+    respuesta = resp.content[0].text.strip()
+    recordar_turno(session, "bot", respuesta)
+    await context.bot.send_message(chat_id, respuesta, parse_mode=ParseMode.MARKDOWN)
 
 
 async def responder_consulta_progreso(chat_id: int, user_id: int, texto: str,
+                                      session: dict,
                                       context: ContextTypes.DEFAULT_TYPE):
     """
     Contesta preguntas sobre la propia evolución del jugador ("¿mejoré el saque?",
@@ -1495,13 +1543,94 @@ Responde en 2-3 párrafos cortos, apoyándote SIEMPRE en los datos de arriba.
 - Si ves algo relevante que el jugador no preguntó pero se desprende de los datos, agrégalo en una línea al final.
 - Tono directo y cercano, de coach que le sigue la pista."""
 
-    resp = claude.messages.create(
+    resp      = claude.messages.create(
         model=MODELO_CONSEJO,
         max_tokens=800,
         messages=[{"role": "user", "content": prompt}]
     )
-    await context.bot.send_message(chat_id, resp.content[0].text.strip(),
-                                   parse_mode=ParseMode.MARKDOWN)
+    respuesta = resp.content[0].text.strip()
+    recordar_turno(session, "bot", respuesta)
+    await context.bot.send_message(chat_id, respuesta, parse_mode=ParseMode.MARKDOWN)
+
+
+async def responder_charla(chat_id: int, user_id: int, texto: str, session: dict,
+                           context: ContextTypes.DEFAULT_TYPE):
+    """
+    Contesta un mensaje social o anímico sin salirse del personaje de coach.
+    Antes esto caía en fuera_de_alcance y respondía con un muro; un "vengo
+    cansadísimo" es algo a lo que un coach responde, no algo que deba rebotar.
+    """
+    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    perfil = obtener_perfil(user_id)
+    nivel  = (perfil or {}).get("nivel_actual") or "—"
+    conv   = render_conversacion(session)
+    bloque_conv = f"\nCONVERSACIÓN RECIENTE:\n{conv}\n" if conv else ""
+
+    prompt = f"""Eres un coach de pádel conversando por Telegram con un jugador de nivel {nivel}. Te escribió algo que no es un reporte de sesión ni una consulta técnica: charla, un comentario de ánimo, un agradecimiento.
+{bloque_conv}
+MENSAJE: "{texto}"
+
+Contéstale en 1 o 2 frases, como lo haría un coach que lo conoce: natural y cercano.
+- NO enumeres tus funciones ni le expliques cómo usarte. De eso se encarga otra parte del bot.
+- Si lo que dice se conecta con su juego, tira del hilo con una pregunta corta.
+- Un emoji como máximo, y sólo si suma."""
+
+    try:
+        resp      = claude.messages.create(
+            model=MODELO_CONSEJO,
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        respuesta = resp.content[0].text.strip()
+    except Exception as e:
+        log.error(f"responder_charla falló: {e}")
+        respuesta = "Te leo. 🎾"
+
+    recordar_turno(session, "bot", respuesta)
+    await context.bot.send_message(chat_id, respuesta, parse_mode=ParseMode.MARKDOWN)
+
+
+# ── GUÍA CONTEXTUAL ───────────────────────────────────────────────────────────
+# Una sugerencia por turno, y nunca la misma dos veces seguidas. La alternativa
+# —pegar el menú de funciones al final de cada respuesta— se vuelve ruido a la
+# tercera vez, sobre todo para quien ya conoce el bot. Acá la guía es el
+# siguiente paso que tiene sentido dado lo que acaba de pasar.
+
+def sugerir_siguiente_paso(session: dict, perfil: dict | None, intent: str,
+                           analysis: dict = None) -> str | None:
+    """Devuelve la sugerencia a mostrar tras responder, o None si no toca."""
+    n = (perfil or {}).get("partidos_total") or 0
+    candidatas = []
+
+    if intent in CATEGORIAS_CONSEJO:
+        candidatas.append("💡 Cuando lo pruebes en cancha, cuéntame cómo te fue y lo miramos con datos.")
+
+    elif intent == "analisis" and (analysis or {}).get("prioridad_semana"):
+        candidatas.append(
+            f"💡 ¿Te explico cómo entrenar esto?\n_{analysis['prioridad_semana']}_")
+
+    elif intent == "consulta_progreso":
+        candidatas.append("💡 Si quieres trabajar alguno de esos puntos, pregúntame cómo y te doy ejercicios concretos.")
+
+    elif intent in ("ver_historial", "ver_nivel", "ver_ultimo_analisis"):
+        if n >= 3:
+            candidatas.append("💡 También puedo sacarte conclusiones, no sólo la lista. Prueba con _\"¿mejoré el saque?\"_")
+
+    elif intent in ("saludo", "charla", "fuera_de_alcance"):
+        if n == 0:
+            candidatas.append("💡 Cuéntame tu primer partido o entrenamiento y empezamos a construir tu historial.")
+        else:
+            candidatas.append("💡 ¿Jugaste o entrenaste últimamente? Cuéntamelo y te lo analizo.")
+
+    if n == 0 and not candidatas:
+        candidatas.append("💡 Cuéntame un partido o un entrenamiento y empezamos.")
+
+    for c in candidatas:
+        if c != session.get("ultima_sugerencia"):
+            session["ultima_sugerencia"] = c
+            return c
+    return None
 
 
 async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
@@ -1626,11 +1755,16 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
     log.info(f"step_actual='{step_actual}' ejecutando intent/extracción")
 
     # ── Ruteo semántico ──────────────────────────────────────────────────────
-    # Una sola llamada decide qué quiere el jugador. Sin respaldo por keywords:
-    # si el clasificador no responde, le pedimos que repita antes que adivinar.
+    # Una sola llamada decide qué quiere el jugador, con los turnos recientes como
+    # contexto para que los seguimientos ("¿y eso cómo lo entreno?") caigan donde
+    # corresponde. Sin respaldo por keywords: si el clasificador no responde, le
+    # pedimos que repita antes que adivinar.
     if step_actual == "waiting_input":
-        rut    = clasificar_mensaje(texto, session.get("draft"), session.get("tipo_sesion"))
-        intent = rut["intent"]
+        conv_previa = render_conversacion(session)
+        rut         = clasificar_mensaje(texto, session.get("draft"),
+                                         session.get("tipo_sesion"), conv_previa)
+        intent      = rut["intent"]
+        recordar_turno(session, "usuario", texto)
         log.info(f"intent='{intent}' via={rut['via']}")
 
         if intent is None:
@@ -1652,59 +1786,55 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
             session["tipo_sesion"] = tipo
             # cae a extracción
 
-        elif intent == "corregir":
-            # El tipo ya está fijado por la sesión en curso; sólo extraemos
-            pass
+        elif intent != "corregir":
+            # Todo lo que se responde y cierra el turno sale por acá, con una
+            # única salida para que la guía contextual se aplique una sola vez.
+            if intent in CATEGORIAS_CONSEJO:
+                await responder_consejo(chat_id, user_id, texto, intent, session, context)
 
-        elif intent in CATEGORIAS_CONSEJO:
-            await responder_consejo(chat_id, user_id, texto, intent, context)
-            return
+            elif intent == "consulta_progreso":
+                await responder_consulta_progreso(chat_id, user_id, texto, session, context)
 
-        elif intent == "consulta_progreso":
-            await responder_consulta_progreso(chat_id, user_id, texto, context)
-            return
+            elif intent == "ver_historial":
+                await cmd_historial_chat(chat_id, user_id, context)
+                recordar_turno(session, "bot", "Le mostré el listado de sus sesiones.")
 
-        elif intent == "ver_historial":
-            await cmd_historial_chat(chat_id, user_id, context)
-            return
+            elif intent == "ver_nivel":
+                await cmd_minivel_chat(chat_id, user_id, context)
+                recordar_turno(session, "bot", "Le mostré su nivel actual y su progreso.")
 
-        elif intent == "ver_nivel":
-            await cmd_minivel_chat(chat_id, user_id, context)
-            return
+            elif intent == "ver_ultimo_analisis":
+                await cmd_resumen_chat(chat_id, user_id, context)
+                recordar_turno(session, "bot", "Le repetí el último análisis.")
 
-        elif intent == "ver_ultimo_analisis":
-            await cmd_resumen_chat(chat_id, user_id, context)
-            return
+            elif intent == "ayuda":
+                await context.bot.send_message(chat_id, TEXTO_AYUDA,
+                                               parse_mode=ParseMode.MARKDOWN)
+                recordar_turno(session, "bot", "Le expliqué qué puedo hacer.")
 
-        elif intent == "saludo":
-            perfil   = obtener_perfil(user_id)
-            nivel    = (perfil or {}).get("nivel_actual", "—")
-            partidos = (perfil or {}).get("partidos_total", 0)
-            hist_tip = " Puedes decirme cosas como _\"igual que siempre pero con más errores en la red\"_." if partidos > 0 else ""
-            await context.bot.send_message(
-                chat_id,
-                f"👋 ¡Hola! Soy tu coach de pádel.\n\n"
-                f"📊 Nivel actual: *{nivel}* · Partidos registrados: *{partidos}*\n\n"
-                f"Cuéntame cómo te fue en un partido o un entrenamiento — por audio "
-                f"o texto, como te salga.{hist_tip}\n\n"
-                f"También puedes preguntarme por un golpe, por una decisión de juego, "
-                f"por los nervios en cancha, o por cómo vienes progresando.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
+            elif intent == "saludo":
+                perfil   = obtener_perfil(user_id)
+                nivel    = (perfil or {}).get("nivel_actual", "—")
+                sesiones = (perfil or {}).get("partidos_total", 0)
+                saludo   = (f"👋 ¡Hola! Soy tu coach de pádel.\n\n"
+                            f"📊 Nivel actual: *{nivel}* · Partidos registrados: *{sesiones}*")
+                recordar_turno(session, "bot", saludo)
+                await context.bot.send_message(chat_id, saludo,
+                                               parse_mode=ParseMode.MARKDOWN)
 
-        elif intent == "ayuda":
-            await context.bot.send_message(chat_id, TEXTO_AYUDA,
-                                           parse_mode=ParseMode.MARKDOWN)
-            return
+            elif intent == "charla":
+                await responder_charla(chat_id, user_id, texto, session, context)
 
-        elif intent == "fuera_de_alcance":
-            await context.bot.send_message(
-                chat_id,
-                "🎾 Eso se me escapa — soy tu coach de pádel y sólo sé de eso.\n\n"
-                "Cuéntame de un partido o un entrenamiento, pregúntame por un golpe "
-                "o por cómo vienes progresando."
-            )
+            else:  # fuera_de_alcance — cortito, y la sugerencia hace el puente
+                fuera = "🎾 De eso no sé: soy tu coach de pádel y me quedo ahí."
+                recordar_turno(session, "bot", fuera)
+                await context.bot.send_message(chat_id, fuera)
+
+            sugerencia = sugerir_siguiente_paso(session, obtener_perfil(user_id), intent)
+            if sugerencia:
+                recordar_turno(session, "bot", sugerencia)
+                await context.bot.send_message(chat_id, sugerencia,
+                                               parse_mode=ParseMode.MARKDOWN)
             return
 
     # ── Extracción ───────────────────────────────────────────────────────────
@@ -2544,14 +2674,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Asegúrate de que use el bot y tenga su perfil creado.",
                     parse_mode=ParseMode.MARKDOWN
                 )
-        await context.bot.send_message(
-            chat_id,
-            "💬 *¿Querés agregar algo más?* (opcional)\n"
-            "Podés contarme sobre errores específicos, momentos emocionales clave, "
-            "o cualquier detalle de la sesión. También podés escribir /nuevo para la próxima.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        sessions.pop(chat_id, None)
+        sugerencia = sugerir_siguiente_paso(session, obtener_perfil(user.id),
+                                            "analisis", analysis)
+        cierre = sugerencia or ("💬 ¿Querés agregar algún detalle más de la sesión? "
+                                "Contámelo y lo sumo.")
+        recordar_turno(session, "bot", cierre)
+        await context.bot.send_message(chat_id, cierre, parse_mode=ParseMode.MARKDOWN)
+
+        # Cerramos el registro pero conservamos la conversación: la sugerencia de
+        # arriba invita a un seguimiento, y sin memoria no habría con qué responderlo.
+        sessions[chat_id] = {
+            "draft": {}, "step": "waiting_input", "pending_field": None,
+            "conversacion":      session.get("conversacion", []),
+            "ultima_sugerencia": session.get("ultima_sugerencia"),
+        }
 
     # ── corregir ─────────────────────────────────────────────────────────────
     elif data == "corregir":

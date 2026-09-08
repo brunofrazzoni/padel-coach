@@ -145,6 +145,49 @@ primera lee el historial completo y **saca una conclusión** ("¿mejoré el saqu
 "¿me va mejor contra 4ta?"). El prompt le exige decir que no sabe cuando los datos no
 alcanzan, en vez de inventar una tendencia.
 
+### Conversación y memoria
+
+El bot sostiene una conversación: `sessions[chat_id]["conversacion"]` guarda los
+últimos 8 turnos (400 caracteres cada uno) y se los pasa al router y a los handlers
+de respuesta.
+
+Sin eso, cada mensaje se clasificaba aislado y un *"¿y eso cómo lo entreno?"* llegaba
+al router como una pregunta suelta de cinco palabras. Ahora el prompt lleva los turnos
+recientes y la instrucción de resolver los seguimientos según el tema de la última
+respuesta — incluido un *"dale"* que acepta algo que el bot acaba de ofrecer.
+
+La intención `charla` existe por lo mismo: un *"vengo cansadísimo, no di una hoy"* es
+algo a lo que un coach responde, no algo que deba rebotar contra un muro.
+`fuera_de_alcance` queda sólo para lo que no tiene que ver ni con pádel ni con el
+jugador.
+
+> ⚠️ `sessions` vive en memoria del proceso, así que **un redeploy de Railway borra la
+> conversación**. Ya pasaba con los borradores a medio llenar; con conversación se nota
+> más. Persistirla en Supabase sería el siguiente paso si molesta.
+
+### Guía contextual
+
+Tras responder, el bot agrega **una** sugerencia: el siguiente paso que tiene sentido
+dado lo que acaba de pasar. La decide `sugerir_siguiente_paso()`.
+
+| Momento | Sugerencia |
+|---|---|
+| Tras un consejo | *"Cuando lo pruebes en cancha, cuéntame cómo te fue"* |
+| Tras un análisis | *"¿Te explico cómo entrenar esto?"* + la prioridad de la semana |
+| Tras ver historial o nivel, con 3+ sesiones | *"También puedo sacarte conclusiones, no sólo la lista"* |
+| Tras charla o saludo, con 0 sesiones | *"Cuéntame tu primer partido o entrenamiento"* |
+| Tras una consulta de progreso | *"Pregúntame cómo trabajar esos puntos"* |
+
+Dos reglas: **una sola sugerencia por turno**, y **nunca la misma dos veces seguidas**
+(se recuerda en `session["ultima_sugerencia"]`).
+
+La alternativa —pegar el menú de funciones al final de cada respuesta— se vuelve ruido
+a la tercera vez, sobre todo para quien ya conoce el bot. Por eso la guía es
+permanente en presencia pero no en repetición.
+
+Tras el análisis la sesión se reinicia pero **se conserva la conversación**: la
+sugerencia invita a un seguimiento y sin memoria no habría con qué responderlo.
+
 ### Sin respaldo por keywords
 
 El router reintenta una vez. Si tampoco así obtiene una intención válida, devuelve

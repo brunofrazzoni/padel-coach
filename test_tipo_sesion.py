@@ -107,7 +107,8 @@ check("teclado tipo entrenamiento: 5 opciones + Otro",
       sum(len(f) for f in kb3.inline_keyboard), 6)
 
 print("\n== taxonomía de intenciones ==")
-check("13 intenciones declaradas", len(bot.INTENTS), 13)
+check("14 intenciones declaradas", len(bot.INTENTS), 14)
+check("charla es una intención", "charla" in bot.INTENTS, True)
 check("las 5 que pidió el usuario están",
       {"registrar_partido", "registrar_entrenamiento", "consejo_tecnico",
        "consejo_tactico", "consejo_emocional"} <= set(bot.INTENTS), True)
@@ -210,6 +211,76 @@ check("respuesta no-JSON dos veces -> intent None", r["intent"], None)
 f = ClaudeFalso('{"intent": "chachacha"}', '{"intent": "otra_invencion"}')
 r = con_claude(f, "cualquier cosa")
 check("intent inválido dos veces -> intent None (sin adivinar)", r["intent"], None)
+
+print("\n== memoria conversacional ==")
+s = {}
+bot.recordar_turno(s, "usuario", "cómo le pego a la bandeja")
+bot.recordar_turno(s, "bot", "Con el brazo alto y golpe plano.")
+check("guarda los turnos en orden", [t["rol"] for t in s["conversacion"]],
+      ["usuario", "bot"])
+check("render etiqueta los roles",
+      bot.render_conversacion(s),
+      "Jugador: cómo le pego a la bandeja\nTú: Con el brazo alto y golpe plano.")
+
+s2 = {}
+for i in range(20):
+    bot.recordar_turno(s2, "usuario", "mensaje %d" % i)
+check("corta a MAX_TURNOS_CONVERSACION",
+      len(s2["conversacion"]), bot.MAX_TURNOS_CONVERSACION)
+check("conserva los más recientes", s2["conversacion"][-1]["texto"], "mensaje 19")
+
+s3 = {}
+bot.recordar_turno(s3, "bot", "x" * 5000)
+check("trunca turnos largos",
+      len(s3["conversacion"][0]["texto"]), bot.MAX_CHARS_TURNO)
+
+s4 = {}
+bot.recordar_turno(s4, "usuario", "")
+check("ignora texto vacío", s4.get("conversacion"), None)
+check("sesión sin conversación rinde vacío", bot.render_conversacion({}), "")
+
+print("\n== el router recibe la conversación ==")
+p_conv = bot._prompt_router("y eso cómo lo entreno",
+                            conversacion="Jugador: cómo le pego a la bandeja\nTú: brazo alto")
+check("inyecta los turnos recientes", "brazo alto" in p_conv, True)
+check("instruye a resolver seguimientos",
+      "clasifícalo" in p_conv and "TEMA de esa respuesta" in p_conv, True)
+check("sin conversación no agrega el bloque",
+      "CONVERSACIÓN RECIENTE" in bot._prompt_router("hola"), False)
+
+f = ClaudeFalso('{"intent": "consejo_tecnico"}')
+r = con_claude(f, "y eso cómo lo entreno", None, None,
+               "Jugador: cómo le pego a la bandeja\nTú: brazo alto")
+check("clasificar_mensaje acepta y usa la conversación", r["intent"], "consejo_tecnico")
+
+print("\n== guía contextual ==")
+perfil_nuevo   = {"partidos_total": 0}
+perfil_veterano = {"partidos_total": 8}
+
+s5 = {}
+sug = bot.sugerir_siguiente_paso(s5, perfil_veterano, "consejo_tecnico")
+check("tras un consejo, invita a reportar", "cuéntame cómo te fue" in (sug or ""), True)
+check("no repite la misma sugerencia seguida",
+      bot.sugerir_siguiente_paso(s5, perfil_veterano, "consejo_tecnico"), None)
+
+s6 = {}
+sug = bot.sugerir_siguiente_paso(s6, perfil_veterano, "analisis",
+                                 {"prioridad_semana": "salida de pared"})
+check("tras el análisis, ofrece entrenar la prioridad",
+      "salida de pared" in (sug or ""), True)
+check("sin prioridad no inventa sugerencia de análisis",
+      bot.sugerir_siguiente_paso({}, perfil_veterano, "analisis", {}), None)
+
+check("usuario nuevo: empuja a registrar la primera",
+      "primer partido" in (bot.sugerir_siguiente_paso({}, perfil_nuevo, "saludo") or ""),
+      True)
+check("veterano tras ver historial: ofrece conclusiones",
+      "conclusiones" in (bot.sugerir_siguiente_paso({}, perfil_veterano, "ver_historial") or ""),
+      True)
+check("veterano con <3 sesiones no recibe esa sugerencia",
+      bot.sugerir_siguiente_paso({}, {"partidos_total": 1}, "ver_historial"), None)
+check("una intención sin sugerencia devuelve None",
+      bot.sugerir_siguiente_paso({}, perfil_veterano, "corregir"), None)
 
 print("\n" + ("TODO OK" if not fallos else "FALLOS:\n" + "\n".join(fallos)))
 sys.exit(1 if fallos else 0)
