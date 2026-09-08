@@ -16,7 +16,7 @@ from supabase import create_client
 load_dotenv()
 
 # ── VERSIÓN ────────────────────────────────────────────────────────────────────
-BOT_VERSION = "08/09/2026 12:00"  # última actualización
+BOT_VERSION = "08/09/2026 17:45"  # última actualización
 
 # ── LOGGING — formato enriquecido con función y línea ─────────────────────────
 logging.basicConfig(
