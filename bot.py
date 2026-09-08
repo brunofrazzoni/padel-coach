@@ -31,9 +31,19 @@ claude    = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 groq      = Groq(api_key=os.environ["GROQ_API_KEY"])
 supabase  = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-# Modelo del router de intenciones: clasificar es una tarea corta y frecuente,
-# así que va en el modelo más rápido y barato. El análisis sigue en Sonnet.
-MODELO_ROUTER = "claude-haiku-4-5"
+# ── MODELOS ───────────────────────────────────────────────────────────────────
+# Un modelo por tipo de llamada, sobreescribible por variable de entorno para
+# poder A/B testear en producción sin tocar el código ni redeployar.
+MODELO_DEFECTO = "claude-haiku-4-5"
+
+def _modelo(var: str) -> str:
+    return os.environ.get(var, MODELO_DEFECTO)
+
+MODELO_ROUTER     = _modelo("MODELO_ROUTER")      # clasificar la intención
+MODELO_EXTRACCION = _modelo("MODELO_EXTRACCION")  # sacar campos del relato
+MODELO_ANALISIS   = _modelo("MODELO_ANALISIS")    # el análisis del coach
+MODELO_CONSEJO    = _modelo("MODELO_CONSEJO")     # responder consultas
+MODELO_NIVEL      = _modelo("MODELO_NIVEL")       # inferir la categoría
 
 INVITE_CODE  = os.environ.get("INVITE_CODE", "padel2024")
 ADMIN_IDS    = set(int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip())
@@ -618,38 +628,21 @@ def construir_contexto_historial(historial: list) -> dict:
     return promedios
 
 def extraer_datos_claude(texto: str, draft_actual: dict, historial: list = None,
-                         tipo_sesion=None) -> dict:
+                         tipo_sesion=TIPO_PARTIDO) -> dict:
     """
-    Claude lee el texto del usuario y extrae campos.
-    Con historial, puede inferir valores de frases como 'igual que siempre' o
-    'todo bien menos el saque' sin necesitar input explícito para cada campo.
+    Extrae los campos de la sesión del relato del jugador.
 
-    Si tipo_sesion es None, Claude además clasifica partido vs entrenamiento y
-    devuelve la clave "tipo_sesion" — es el paso 2 del híbrido de detección
-    (keywords obvias primero, Claude como desempate).
+    El tipo de sesión ya viene decidido por el router, así que esta llamada
+    tiene un solo camino: extraer los campos de ese tipo. Con historial puede
+    resolver frases como 'igual que siempre' o 'todo bien menos el saque'.
     """
+    tipo               = normalizar_tipo(tipo_sesion)
     draft_json         = json.dumps(draft_actual, ensure_ascii=False)
     categorias_validas = ", ".join(CATEGORIAS)
-
-    if tipo_sesion is None:
-        campos_json = json.dumps({
-            TIPO_PARTIDO:       {**CAMPOS, **CAMPOS_OPCIONALES},
-            TIPO_ENTRENAMIENTO: {**CAMPOS_ENTRENAMIENTO, **CAMPOS_OPCIONALES_ENTRENAMIENTO},
-        }, ensure_ascii=False, indent=2)
-        bloque_tipo = f"""PASO 1 — CLASIFICA LA SESIÓN (las keywords no alcanzaron para decidir):
-- PARTIDO: hubo competencia real — marcador, rivales, torneo, americano, sets.
-- ENTRENAMIENTO: clase, drills, sparring, canasta, ejercicios, práctica libre.
-- Si entrenó y además jugó puntos sueltos sin marcador, es ENTRENAMIENTO.
-- Si hay un marcador competitivo, es PARTIDO aunque haya empezado calentando.
-Incluye SIEMPRE la clave "tipo_sesion" con el valor "{TIPO_PARTIDO}" o "{TIPO_ENTRENAMIENTO}".
-
-PASO 2 — EXTRAE SOLO LOS CAMPOS DEL TIPO QUE ELEGISTE:
-{campos_json}"""
-    else:
-        campos_json = json.dumps(
-            {**campos_de(tipo_sesion), **campos_opcionales_de(tipo_sesion)},
-            ensure_ascii=False, indent=2)
-        bloque_tipo = f"""TIPO DE SESIÓN YA CONFIRMADO: {normalizar_tipo(tipo_sesion)}
+    campos_json        = json.dumps(
+        {**campos_de(tipo), **campos_opcionales_de(tipo)},
+        ensure_ascii=False, indent=2)
+    bloque_tipo = f"""TIPO DE SESIÓN: {tipo}
 
 CAMPOS QUE NECESITAS EXTRAER:
 {campos_json}"""
@@ -699,11 +692,11 @@ REGLAS DE EXTRACCIÓN BASE:
 {reglas_hist}
 
 Responde SOLO con JSON. Sin markdown.
-Ejemplo partido: {{"tipo_sesion": "partido", "resultado": "6-4 / 3-6", "saque": 6, "peloteo": 5}}
-Ejemplo entrenamiento: {{"tipo_sesion": "entrenamiento", "tipo_entrenamiento": "drills", "foco_sesion": "bandeja", "juego_red": 7}}"""
+Ejemplo partido: {{"resultado": "6-4 / 3-6", "saque": 6, "peloteo": 5}}
+Ejemplo entrenamiento: {{"tipo_entrenamiento": "drills", "foco_sesion": "bandeja", "juego_red": 7}}"""
 
     resp = claude.messages.create(
-        model="claude-sonnet-4-6",
+        model=MODELO_EXTRACCION,
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -715,10 +708,15 @@ Ejemplo entrenamiento: {{"tipo_sesion": "entrenamiento", "tipo_entrenamiento": "
         return {}
     return datos if isinstance(datos, dict) else {}
 
-def buscar_conocimiento(query: str, nivel: str, limite: int = 5) -> str:
+def buscar_conocimiento(query: str, nivel: str, limite: int = 5,
+                        categoria: str = None) -> str:
     """
     Busca en la base de conocimiento de pádel usando full-text search.
     Retorna texto formateado listo para inyectar en el prompt de Claude.
+
+    Con `categoria` ("técnica" / "táctica" / "emocional") se priorizan los
+    bloques de esa categoría: el router ya sabe de qué tipo es la consulta,
+    así que conviene no mezclar consejos de otra dimensión en la respuesta.
     """
     try:
         # Mapear nivel inferido a categoría de conocimiento
@@ -740,14 +738,22 @@ def buscar_conocimiento(query: str, nivel: str, limite: int = 5) -> str:
 
         resultados = resp.data or []
 
+        if categoria and resultados:
+            # Priorizar sin descartar: si no hay nada de la categoría pedida,
+            # es mejor responder con lo que haya que no responder nada.
+            de_categoria = [r for r in resultados if r.get("categoria") == categoria]
+            if de_categoria:
+                resultados = de_categoria
+
         if not resultados:
             # Fallback: traer los más relevantes por nivel sin búsqueda textual
-            resp2 = (supabase.table("conocimiento_padel")
-                     .select("titulo,categoria,contenido,frase_coach,media_url")
-                     .eq("activo", True)
-                     .in_("nivel_objetivo", [nivel_conocimiento, "todos"])
-                     .limit(limite)
-                     .execute())
+            q2 = (supabase.table("conocimiento_padel")
+                  .select("titulo,categoria,contenido,frase_coach,media_url")
+                  .eq("activo", True)
+                  .in_("nivel_objetivo", [nivel_conocimiento, "todos"]))
+            if categoria:
+                q2 = q2.eq("categoria", categoria)
+            resp2 = q2.limit(limite).execute()
             resultados = resp2.data or []
 
         if not resultados:
@@ -926,7 +932,7 @@ Responde SOLO con este JSON (sin markdown):
 }}"""
 
     resp = claude.messages.create(
-        model="claude-sonnet-4-6",
+        model=MODELO_ANALISIS,
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -1030,7 +1036,7 @@ REGLAS:
 Responde SOLO con el nombre exacto de la categoría. Sin explicación."""
 
     resp = claude.messages.create(
-        model="claude-sonnet-4-6",
+        model=MODELO_NIVEL,
         max_tokens=20,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -1180,244 +1186,151 @@ async def mostrar_resumen_y_confirmar(chat_id: int, context: ContextTypes.DEFAUL
         reply_markup=teclado_confirmacion_final(tipo)
     )
 
-# ── DETECCIÓN PARTIDO vs ENTRENAMIENTO ────────────────────────────────────────
-# Híbrido en dos pasos: keywords obvias resuelven la mayoría de los casos sin
-# costo; cuando el texto es ambiguo o mixto devolvemos None y desempata Claude
-# dentro de extraer_datos_claude().
-
-ENTRENAMIENTO_KW = [
-    "entrenamiento", "entrenamos", "entrené", "entrene", "entrenando", "entrenar",
-    "clase", "clases", "profe", "entrenador", "academia",
-    "práctica", "practica", "practiqué", "practique", "practicamos", "practicando",
-    "drill", "drills", "ejercicio", "ejercicios", "canasta", "sparring",
-    "máquina de pelotas", "maquina de pelotas", "físico", "fisico", "gimnasio",
-]
-
-PARTIDO_KW = [
-    "partido", "partidazo", "partidos", "jugamos contra", "ganamos", "perdimos",
-    "ganamos el", "perdimos el", "rivales", "rival", "torneo", "campeonato",
-    "americano", "tie break", "tiebreak", "sets", "primer set", "segundo set",
-]
-
-# Un marcador explícito ("6-4", "6/2") es la señal más fuerte de partido
-RE_MARCADOR = re.compile(r"\b\d{1,2}\s*[-/]\s*\d{1,2}\b")
-
-
-def detectar_tipo_sesion(texto: str) -> str | None:
-    """
-    Paso 1 del híbrido. Devuelve TIPO_PARTIDO, TIPO_ENTRENAMIENTO, o None si el
-    texto es ambiguo o mezcla señales de ambos (en cuyo caso decide Claude).
-    """
-    t = f" {texto.lower().strip()} "
-
-    hits_e = sum(1 for kw in ENTRENAMIENTO_KW if kw in t)
-    hits_p = sum(1 for kw in PARTIDO_KW if kw in t)
-    if RE_MARCADOR.search(texto):
-        hits_p += 2
-
-    if hits_e and not hits_p:
-        return TIPO_ENTRENAMIENTO
-    if hits_p and not hits_e:
-        return TIPO_PARTIDO
-    return None  # ambiguo o mixto → desempata Claude
-
-
-def detectar_intent(texto: str) -> str:
-    """
-    Ruteo por keywords. Ya NO es el camino principal — quedó como red de
-    seguridad de clasificar_mensaje() cuando la llamada al modelo falla.
-    Es frágil por diseño: matchea por prefijo y substring, así que confunde
-    "hola, ganamos 6-4" con un saludo. Ver clasificar_mensaje().
-    """
-    t = texto.lower().strip()
-
-    saludos = ["hola", "buenas", "buen día", "buen dia", "buenos días", "buenos dias",
-               "buenas tardes", "buenas noches", "hey", "hi", "hello",
-               "qué tal", "que tal", "cómo estás", "como estas", "cómo está",
-               "como esta", "cómo te va", "como te va"]
-    for kw in saludos:
-        if t == kw or t.startswith(kw + " ") or t.startswith(kw + "!") or t.startswith(kw + ","):
-            return "saludo"
-
-    historial_kw = ["historial", "partidos anteriores", "mis partidos", "cuántos partidos",
-                    "cuantos partidos", "últimos partidos", "ultimos partidos"]
-    nivel_kw     = ["mi nivel", "cómo voy", "como voy", "qué nivel", "que nivel",
-                    "mi progreso", "progreso", "cuánto he mejorado", "cuanto he mejorado",
-                    "en qué categoría", "en que categoria"]
-    resumen_kw   = ["último análisis", "ultimo analisis", "último partido", "ultimo partido",
-                    "qué fue lo último", "que fue lo ultimo", "lo que trabajamos",
-                    "resumen", "mi análisis", "mi analisis"]
-    nuevo_kw     = ["nuevo partido", "registrar partido", "quiero registrar",
-                    "empezar partido", "partido nuevo", "agregar partido",
-                    "nuevo entrenamiento", "registrar entrenamiento",
-                    "entrenamiento nuevo", "agregar entrenamiento"]
-    ayuda_kw     = ["ayuda", "comandos", "qué puedes hacer", "que puedes hacer",
-                    "cómo funciona", "como funciona", "qué haces", "que haces",
-                    "instrucciones", "para qué sirves", "para que sirves"]
-    consulta_kw  = ["qué es", "que es", "cómo se hace", "como se hace",
-                    "cómo ejecuto", "como ejecuto", "explícame", "explicame",
-                    "cómo mejoro", "como mejoro", "técnica de", "tecnica de",
-                    "cómo se juega", "como se juega", "tips de", "consejo sobre",
-                    "háblame de", "hablame de", "información sobre", "informacion sobre",
-                    "enséñame", "ensenme", "qué es la", "que es la", "qué es el", "que es el"]
-    golpes_kw    = ["bandeja", "víbora", "vibora", "volea", "globo", "smash", "remate",
-                    "chiquita", "volcada", "bajada de pared", "contrapared", "bote pronto",
-                    "dormilona", "salida de pared", "revés", "reves", "saque", "servicio"]
-
-    for kw in historial_kw:
-        if kw in t: return "historial"
-    for kw in nivel_kw:
-        if kw in t: return "minivel"
-    for kw in resumen_kw:
-        if kw in t: return "resumen"
-    for kw in nuevo_kw:
-        if kw in t: return "nuevo"
-    for kw in ayuda_kw:
-        if kw in t: return "ayuda"
-    # Consulta técnica: solo si hay signo de pregunta O mensaje muy corto
-    es_pregunta = "?" in texto
-    es_corto    = len(t.split()) <= 6
-
-    if es_pregunta or es_corto:
-        for kw in consulta_kw:
-            if kw in t: return "consulta_tecnica"
-        for kw in golpes_kw:
-            if t == kw or t == f"la {kw}" or t == f"el {kw}" or t == f"la {kw}?" or t == f"el {kw}?":
-                return "consulta_tecnica"
-
-    return "reporte"
+TEXTO_AYUDA = (
+    "🎾 *Háblame normal — entiendo lo que me digas, por audio o texto.*\n\n"
+    "*Registrar*\n"
+    "• _\"Ganamos 6-4 6-2 contra los de 4ta\"_ — un partido\n"
+    "• _\"Entrené bandeja con el profe\"_ — un entrenamiento\n"
+    "• _\"El saque fue 8, no 6\"_ — corregir algo que ya me contaste\n\n"
+    "*Preguntarme*\n"
+    "• _\"Cómo le pego a la bandeja\"_ — técnica, la ejecución del golpe\n"
+    "• _\"Cuándo subo a la red\"_ — táctica, las decisiones del punto\n"
+    "• _\"Me pongo nervioso en los puntos clave\"_ — la cabeza en cancha\n\n"
+    "*Tus datos*\n"
+    "• _\"He mejorado el saque\"_ — una conclusión sobre tu evolución\n"
+    "• _\"Mis partidos\"_ · _\"Cómo voy\"_ · _\"Último análisis\"_\n\n"
+    "No hacen falta comandos con `/` ni palabras exactas."
+)
 
 # ── ROUTER DE INTENCIONES ─────────────────────────────────────────────────────
-# El ruteo por keywords fallaba en dos patrones frecuentes:
-#   1. Saludo con reporte pegado — "hola, ganamos 6-4" se clasificaba como
-#      saludo y el reporte se perdía entero.
-#   2. Audio transcrito sin signos de pregunta — Whisper rara vez escribe "?",
-#      así que las consultas técnicas largas caían a reporte.
-# Los keywords sólo son confiables en coincidencia EXACTA, que es donde se
-# quedaron: el resto lo clasifica el modelo.
+# Todo el ruteo es semántico. No queda ninguna detección por keywords: el
+# jugador escribe o dicta como le sale y el modelo decide qué quiere. Los
+# keywords se sacaron porque matcheaban por prefijo y substring, y fallaban
+# 9 de cada 16 frases realistas — sobre todo "hola, ganamos 6-4", que se
+# clasificaba como saludo y perdía el reporte entero.
 
-INTENTS_VALIDOS = {"saludo", "historial", "minivel", "resumen",
-                   "nuevo", "ayuda", "consulta_tecnica", "reporte"}
+INTENTS = {
+    "registrar_partido":       "Cuenta cómo le fue en un partido (hubo competencia y marcador).",
+    "registrar_entrenamiento": "Cuenta cómo le fue en un entrenamiento, clase, drills o sparring.",
+    "corregir":                "Ajusta o agrega un dato de la sesión que está registrando ahora.",
+    "consejo_tecnico":         "Pregunta cómo EJECUTAR un golpe: el gesto, el punto de impacto, la empuñadura.",
+    "consejo_tactico":         "Pregunta por DECISIONES de juego: qué golpe elegir, dónde pararse, cómo construir el punto.",
+    "consejo_emocional":       "Pregunta por nervios, foco, frustración, presión o comunicación con la pareja.",
+    "consulta_progreso":       "Pregunta algo concreto sobre SU propia evolución en los datos que ya registró.",
+    "ver_historial":           "Pide la lista de sus sesiones registradas.",
+    "ver_nivel":               "Pregunta por su categoría actual y su progreso general.",
+    "ver_ultimo_analisis":     "Pide que le repitas el último análisis.",
+    "saludo":                  "Sólo saluda, sin contar ni pedir nada más.",
+    "ayuda":                   "Pregunta qué puedes hacer o cómo funcionas.",
+    "fuera_de_alcance":        "No tiene que ver con pádel ni con lo que hace el bot.",
+}
 
-# Frases que por sí solas no admiten otra lectura. Valor: (intent, tipo_sesion)
-FRASES_EXACTAS = {}
-for _frases, _intent, _tipo in [
-    (["hola", "hola!", "buenas", "buenos días", "buenos dias", "buen día", "buen dia",
-      "buenas tardes", "buenas noches", "hey", "hi", "hello", "qué tal", "que tal"],
-     "saludo", None),
-    (["historial", "mis partidos", "mis entrenamientos", "mis sesiones",
-      "últimos partidos", "ultimos partidos", "partidos anteriores"],
-     "historial", None),
-    (["mi nivel", "cómo voy", "como voy", "qué nivel", "que nivel",
-      "mi progreso", "progreso"],
-     "minivel", None),
-    (["resumen", "último análisis", "ultimo analisis", "mi análisis", "mi analisis"],
-     "resumen", None),
-    (["nuevo partido", "partido nuevo", "registrar partido"],
-     "nuevo", TIPO_PARTIDO),
-    (["nuevo entrenamiento", "entrenamiento nuevo", "registrar entrenamiento"],
-     "nuevo", TIPO_ENTRENAMIENTO),
-    (["nuevo", "empezar de nuevo"], "nuevo", None),
-    (["ayuda", "comandos", "help", "qué puedes hacer", "que puedes hacer",
-      "cómo funciona", "como funciona"],
-     "ayuda", None),
-]:
-    for _f in _frases:
-        FRASES_EXACTAS[_f] = (_intent, _tipo)
+# Las dos intenciones que abren un registro, con el tipo de sesión que implican
+INTENTS_REGISTRO = {
+    "registrar_partido":       TIPO_PARTIDO,
+    "registrar_entrenamiento": TIPO_ENTRENAMIENTO,
+}
+
+# Ejemplos que fijan los límites entre intenciones parecidas. Son la parte del
+# prompt que más mueve la aguja: cada uno existe porque separa un par confuso.
+EJEMPLOS_ROUTER = [
+    ("buenas, ganamos 6-4 6-2 contra los de 4ta",                  "registrar_partido"),
+    ("perdimos en el americano del sábado, jugué muy nervioso",    "registrar_partido"),
+    ("hola profe, estuve toda la tarde con la canasta de bandeja", "registrar_entrenamiento"),
+    ("clase de hora y media, trabajamos salida de pared",          "registrar_entrenamiento"),
+    ("el saque fue 8, no 6",                                       "corregir"),
+    ("en realidad los rivales eran de 5ta alta",                   "corregir"),
+    ("cómo le pego a la bandeja para que no se me vaya larga",     "consejo_tecnico"),
+    ("qué hago cuando la bola sale muy pegada a la pared",         "consejo_tecnico"),
+    ("cuándo conviene subir a la red y cuándo quedarse atrás",     "consejo_tactico"),
+    ("a qué rival le tengo que jugar si uno es zurdo",             "consejo_tactico"),
+    ("me pongo muy nervioso en los puntos importantes y fallo",    "consejo_emocional"),
+    ("cómo dejo de pelearme con mi pareja cuando vamos perdiendo", "consejo_emocional"),
+    ("he mejorado el saque en los últimos partidos",               "consulta_progreso"),
+    ("me va mejor contra los de 4ta o contra los de 5ta",          "consulta_progreso"),
+    ("mis partidos",                                               "ver_historial"),
+    ("qué entrenamientos llevo este mes",                          "ver_historial"),
+    ("cómo voy",                                                   "ver_nivel"),
+    ("en qué categoría estoy",                                     "ver_nivel"),
+    ("repíteme el análisis anterior",                              "ver_ultimo_analisis"),
+    ("hola",                                                       "saludo"),
+    ("qué puedes hacer",                                           "ayuda"),
+    ("cómo está el clima hoy",                                     "fuera_de_alcance"),
+]
 
 
-def _normalizar(texto: str) -> str:
-    """Minúsculas, sin puntuación de borde y con espacios colapsados."""
-    return " ".join(texto.lower().strip().strip("¿?¡!.,;:…").split())
-
-
-def intent_exacto(texto: str) -> tuple | None:
-    """Fast path sin costo: sólo coincidencia exacta, donde los keywords no fallan."""
-    return FRASES_EXACTAS.get(_normalizar(texto))
-
-
-def clasificar_mensaje(texto: str, draft_actual: dict = None,
-                       tipo_en_curso=None) -> dict:
-    """
-    Clasifica el mensaje en una intención y, si es un reporte, en un tipo de sesión.
-
-    Devuelve {"intent": str, "tipo_sesion": str|None, "via": str}. La clave "via"
-    dice de dónde salió la decisión ("exacto", "claude", "fallback") y sólo se usa
-    para logs.
-    """
-    exacto = intent_exacto(texto)
-    if exacto:
-        intent, tipo = exacto
-        return {"intent": intent, "tipo_sesion": tipo, "via": "exacto"}
+def _prompt_router(texto: str, draft_actual: dict = None, tipo_en_curso=None) -> str:
+    catalogo = "\n".join(f'- "{k}": {v}' for k, v in INTENTS.items())
+    ejemplos = "\n".join(f'"{t}" -> {i}' for t, i in EJEMPLOS_ROUTER)
 
     if draft_actual:
-        ctx_draft = (
-            f"\n- El jugador YA está registrando una sesión"
-            f"{' de tipo ' + normalizar_tipo(tipo_en_curso) if tipo_en_curso else ''}"
-            f" y lleva estos campos: {', '.join(draft_actual.keys())}.\n"
-            f"  Un dato suelto o una corrección (\"el saque fue 8\", \"en realidad "
-            f"perdimos\") es \"reporte\", no otra cosa."
-        )
+        campos = ", ".join(draft_actual.keys()) or "ninguno todavía"
+        ctx = (f"\nESTADO ACTUAL: el jugador está registrando un "
+               f"{etiqueta_tipo(tipo_en_curso)} y ya cargó estos campos: {campos}.\n"
+               f"Por eso un mensaje que sólo ajusta o suma datos es \"corregir\", "
+               f"no \"registrar_*\": ya hay un registro abierto.")
     else:
-        ctx_draft = ""
+        ctx = ("\nESTADO ACTUAL: el jugador NO tiene ningún registro abierto, "
+               "así que \"corregir\" no aplica.")
 
-    prompt = f"""Eres el router de intenciones de un bot de pádel por Telegram. Clasifica el mensaje del jugador en UNA sola intención.
+    return f"""Eres el router de intenciones de un coach de pádel por Telegram. Clasifica el mensaje del jugador en UNA sola intención.
 
-INTENCIONES:
-- "saludo": sólo saluda, sin contarte nada ni pedirte nada más.
-- "reporte": te cuenta cómo le fue en una sesión — un partido o un entrenamiento — o te da datos sueltos sobre ella.
-- "consulta_tecnica": pregunta sobre pádel — técnica, táctica, reglas, cómo mejorar un golpe o un concepto del juego.
-- "historial": pide ver sus sesiones pasadas.
-- "minivel": pregunta por SU nivel, categoría o progreso general como jugador.
-- "resumen": pide el último análisis que le diste.
-- "nuevo": quiere empezar a registrar una sesión, pero todavía no la cuenta.
-- "ayuda": pregunta qué puedes hacer o cómo funcionas.
+INTENCIONES POSIBLES:
+{catalogo}
+{ctx}
 
-REGLAS CRÍTICAS:
-- Un saludo SEGUIDO de contenido NO es "saludo". "Hola, ganamos 6-4" es "reporte" y "buenas, cómo pego la bandeja" es "consulta_tecnica". Clasifica por lo que el jugador quiere, no por cómo empieza el mensaje.
-- Los mensajes suelen venir de audio transcrito y NO traen signos de pregunta. "Cómo mejoro la bandeja" es "consulta_tecnica" aunque no lleve "?".
-- Distingue "cómo voy" (minivel: su progreso general) de "cómo voy con la bandeja" (consulta_tecnica: sobre un golpe).
-- "cuántos partidos necesito para subir de categoría" es "consulta_tecnica", no "historial": pregunta por un criterio, no por su lista.
-- "nuevo" es sólo cuando anuncia que va a registrar algo SIN contarlo todavía. Si ya está contando, es "reporte".{ctx_draft}
+CÓMO DESAMBIGUAR:
+- Un saludo SEGUIDO de contenido NO es "saludo". Clasifica por lo que el jugador quiere, no por cómo empieza el mensaje.
+- Los mensajes vienen de audio transcrito y suelen NO traer signos de pregunta. Una pregunta sin "?" sigue siendo una pregunta.
+- Técnico vs táctico: técnico es CÓMO se ejecuta el golpe (el gesto). Táctico es QUÉ golpe elegir, dónde pararse y cómo construir el punto.
+- Consejo vs progreso: "cómo mejoro la bandeja" pide una explicación general -> consejo_tecnico. "He mejorado la bandeja" pregunta por SUS datos -> consulta_progreso.
+- Nivel vs progreso: "cómo voy" pregunta por su categoría -> ver_nivel. "He mejorado el saque" pregunta por una dimensión concreta -> consulta_progreso.
+- Historial vs progreso: "mis partidos" pide la lista -> ver_historial. "Me va mejor contra 4ta" pide una conclusión -> consulta_progreso.
+- Partido vs entrenamiento: si hubo competencia con marcador es partido, aunque haya empezado calentando. Si sólo hubo práctica sin resultado, es entrenamiento.
+- Si el jugador anuncia que va a registrar algo pero todavía no lo cuenta, igual usa "registrar_partido" o "registrar_entrenamiento".
+- Si de verdad no encaja en ninguna, usa "fuera_de_alcance". No fuerces una intención de pádel sobre un mensaje que no lo es.
 
-Si la intención es "reporte" o "nuevo", agrega también "tipo_sesion":
-- "partido": hubo competencia real — marcador, rivales, torneo, americano, sets.
-- "entrenamiento": clase, drills, sparring, canasta, ejercicios, práctica libre.
-- null: todavía no se puede saber.
-En cualquier otra intención, "tipo_sesion" es null.
+EJEMPLOS:
+{ejemplos}
 
 MENSAJE DEL JUGADOR:
 "{texto}"
 
 Responde SOLO con este JSON, sin markdown:
-{{"intent": "<una de las 8>", "tipo_sesion": "partido"|"entrenamiento"|null}}"""
+{{"intent": "<una de las {len(INTENTS)} intenciones>"}}"""
 
-    try:
-        resp = claude.messages.create(
-            model=MODELO_ROUTER,
-            max_tokens=60,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        raw    = resp.content[0].text.strip()
-        clean  = re.sub(r"```json|```", "", raw).strip()
-        datos  = json.loads(clean)
-        intent = datos.get("intent")
-        if intent not in INTENTS_VALIDOS:
-            raise ValueError(f"intent desconocido: {intent!r}")
-        tipo = datos.get("tipo_sesion")
-        return {
-            "intent": intent,
-            "tipo_sesion": tipo if tipo in TIPOS_SESION else None,
-            "via": "claude",
-        }
-    except Exception as e:
-        # Nunca dejar caer el mensaje del usuario por un fallo del clasificador
-        log.error(f"clasificar_mensaje falló ({e}) — uso keywords como respaldo")
-        return {
-            "intent": detectar_intent(texto),
-            "tipo_sesion": detectar_tipo_sesion(texto),
-            "via": "fallback",
-        }
+
+def clasificar_mensaje(texto: str, draft_actual: dict = None,
+                       tipo_en_curso=None) -> dict:
+    """
+    Clasifica el mensaje en una de INTENTS.
+
+    Devuelve {"intent": str|None, "via": str}. Un intent None significa que el
+    clasificador no pudo responder ni tras reintentar: ya no hay respaldo por
+    keywords, así que el llamador tiene que pedirle al jugador que repita.
+    """
+    prompt = _prompt_router(texto, draft_actual, tipo_en_curso)
+    ultimo = None
+
+    for intento in (1, 2):
+        try:
+            resp   = claude.messages.create(
+                model=MODELO_ROUTER,
+                max_tokens=40,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw    = resp.content[0].text.strip()
+            clean  = re.sub(r"```json|```", "", raw).strip()
+            intent = json.loads(clean).get("intent")
+            if intent in INTENTS:
+                return {"intent": intent, "via": f"claude:{intento}"}
+            ultimo = f"intent desconocido {intent!r}"
+        except Exception as e:
+            ultimo = e
+        log.warning(f"router intento {intento}/2 falló: {ultimo}")
+
+    log.error(f"router sin respuesta tras 2 intentos: {ultimo}")
+    return {"intent": None, "via": "error"}
 
 
 def detectar_partner_en_texto(texto: str) -> str | None:
@@ -1468,48 +1381,128 @@ async def notificar_partner(partner: dict, draft: dict, analysis: dict,
     except Exception as e:
         log.error(f"Error notificando partner {partner_user_id}: {e}")
 
-async def responder_consulta_tecnica(chat_id: int, user_id: int, texto: str,
-                                      context: ContextTypes.DEFAULT_TYPE):
-    """Responde preguntas técnicas/tácticas buscando en la base de conocimiento."""
+# Cada intención de consejo mapea a una categoría de conocimiento_padel, que
+# ya trae esa columna. Filtrar por ella evita mezclar dimensiones: si preguntan
+# por nervios, no tiene sentido responder con la empuñadura de la bandeja.
+CATEGORIAS_CONSEJO = {
+    "consejo_tecnico":   ("técnica",   "🎾", "la ejecución del golpe"),
+    "consejo_tactico":   ("táctica",   "🧩", "las decisiones dentro del punto"),
+    "consejo_emocional": ("emocional", "🧘", "la cabeza y las emociones en cancha"),
+}
+
+
+async def responder_consejo(chat_id: int, user_id: int, texto: str, intent: str,
+                            context: ContextTypes.DEFAULT_TYPE):
+    """Responde una consulta de pádel en la dimensión que eligió el router."""
+    categoria, emoji, foco = CATEGORIAS_CONSEJO[intent]
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
-    # Obtener nivel del jugador para contextualizar
     perfil = obtener_perfil(user_id)
-    nivel  = perfil.get("nivel_actual", "5ta alta") if perfil else "5ta alta"
+    nivel  = (perfil or {}).get("nivel_actual") or "5ta alta"
 
-    # Buscar en la base de conocimiento
-    conocimiento = buscar_conocimiento(texto, nivel, limite=3)
+    conocimiento = buscar_conocimiento(texto, nivel, limite=3, categoria=categoria)
 
-    if not conocimiento:
+    # El consejo emocional se apoya en SUS patrones, no sólo en la teoría
+    bloque_personal = ""
+    if intent == "consejo_emocional":
+        ctx  = construir_contexto_historial(
+            obtener_historial(user_id, limite=5, tipo_sesion=TIPO_PARTIDO))
+        dims = {k: ctx[k] for k in ("ansiedad", "foco", "gestion_errores", "comunicacion")
+                if k in ctx}
+        if dims:
+            bloque_personal = (
+                f"\nSUS PROMEDIOS EMOCIONALES EN PARTIDO (0-10; en ansiedad, más alto es peor):\n"
+                f"{json.dumps(dims, ensure_ascii=False)}\n"
+                f"Úsalos para que el consejo hable de él y no sea genérico."
+            )
+
+    if not conocimiento and not bloque_personal:
         await context.bot.send_message(
             chat_id,
-            "🤔 No encontré información sobre eso en mi base de conocimiento aún. "
-            "La base se va ampliando — prueba con otro golpe o término.",
+            f"{emoji} Todavía no tengo material de *{categoria}* sobre eso. "
+            f"La base se va ampliando — prueba con otro golpe o situación.",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    # Usar Claude para dar una respuesta natural usando el conocimiento encontrado
-    prompt = f"""Eres un coach de pádel respondiendo una pregunta de un jugador de nivel {nivel}.
+    bloque_conocimiento = (
+        f"MATERIAL DE {categoria.upper()} DISPONIBLE:\n{conocimiento}"
+        if conocimiento else
+        "No hay material específico en la base para esta consulta: responde con "
+        "criterio de coach, sin inventar datos concretos ni citar fuentes."
+    )
 
-PREGUNTA DEL JUGADOR: "{texto}"
+    prompt = f"""Eres un coach de pádel respondiendo a un jugador de nivel {nivel}. Su consulta es de {categoria}: trata sobre {foco}.
 
-INFORMACIÓN TÉCNICA DISPONIBLE:
-{conocimiento}
+CONSULTA DEL JUGADOR: "{texto}"
 
-Responde de forma directa y útil para su nivel. Máximo 3-4 párrafos cortos.
-- Si hay una frase clave de coach, úsala literalmente.
-- Si hay un link de referencia, inclúyelo al final como "🎥 Ver referencia: [url]".
-- No inventes información que no esté en los datos técnicos provistos.
-- Tono cercano, como un coach que conoce al jugador."""
+{bloque_conocimiento}
+{bloque_personal}
+
+Responde directo y accionable para su nivel. Máximo 3 párrafos cortos.
+- Quédate en la dimensión {categoria}. Si hace falta cruzar a otra, que sea una línea.
+- Si hay una frase clave de coach en el material, úsala literal.
+- Si hay un link de referencia, ciérralo con "🎥 Ver referencia: [url]".
+- No inventes datos técnicos que no estén en el material provisto.
+- Tono cercano, de coach que lo conoce."""
 
     resp = claude.messages.create(
-        model="claude-sonnet-4-6",
+        model=MODELO_CONSEJO,
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}]
     )
-    respuesta = resp.content[0].text.strip()
+    await context.bot.send_message(chat_id, resp.content[0].text.strip(),
+                                   parse_mode=ParseMode.MARKDOWN)
 
-    await context.bot.send_message(chat_id, respuesta, parse_mode=ParseMode.MARKDOWN)
+
+async def responder_consulta_progreso(chat_id: int, user_id: int, texto: str,
+                                      context: ContextTypes.DEFAULT_TYPE):
+    """
+    Contesta preguntas sobre la propia evolución del jugador ("¿mejoré el saque?",
+    "¿me va mejor contra 4ta?") leyendo su historial. A diferencia de /historial,
+    que sólo lista, acá el modelo saca la conclusión.
+    """
+    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    historial = obtener_historial(user_id, limite=20)
+    if not historial:
+        await context.bot.send_message(
+            chat_id,
+            "Todavía no tienes sesiones registradas, así que no hay con qué comparar. "
+            "Cuéntame un partido o un entrenamiento y empezamos a construir la serie."
+        )
+        return
+
+    perfil    = obtener_perfil(user_id)
+    nivel     = (perfil or {}).get("nivel_actual") or "—"
+    lineas    = "\n".join(linea_historial(p) for p in historial)
+    promedios = json.dumps(construir_contexto_historial(historial),
+                           ensure_ascii=False, indent=2)
+
+    prompt = f"""Eres un coach de pádel con acceso al registro completo de un jugador de nivel {nivel}. Te hace una pregunta sobre su propia evolución.
+
+PREGUNTA: "{texto}"
+
+SUS SESIONES ({len(historial)}, más reciente primero):
+{lineas}
+
+PROMEDIOS DE LAS ÚLTIMAS 5:
+{promedios}
+
+Responde en 2-3 párrafos cortos, apoyándote SIEMPRE en los datos de arriba.
+- Cita números concretos y fechas cuando refuercen la respuesta.
+- Si los datos NO alcanzan para responder con honestidad, dilo claramente y explica qué necesitarías registrar para poder contestarla. No inventes una tendencia.
+- Si ves algo relevante que el jugador no preguntó pero se desprende de los datos, agrégalo en una línea al final.
+- Tono directo y cercano, de coach que le sigue la pista."""
+
+    resp = claude.messages.create(
+        model=MODELO_CONSEJO,
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    await context.bot.send_message(chat_id, resp.content[0].text.strip(),
+                                   parse_mode=ParseMode.MARKDOWN)
+
 
 async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
                                 texto: str, context: ContextTypes.DEFAULT_TYPE):
@@ -1633,17 +1626,57 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
     log.info(f"step_actual='{step_actual}' ejecutando intent/extracción")
 
     # ── Ruteo semántico ──────────────────────────────────────────────────────
-    # Una sola llamada decide intención y, si es un reporte, tipo de sesión.
+    # Una sola llamada decide qué quiere el jugador. Sin respaldo por keywords:
+    # si el clasificador no responde, le pedimos que repita antes que adivinar.
     if step_actual == "waiting_input":
         rut    = clasificar_mensaje(texto, session.get("draft"), session.get("tipo_sesion"))
         intent = rut["intent"]
-        log.info(f"intent='{intent}' tipo='{rut['tipo_sesion']}' via={rut['via']}")
+        log.info(f"intent='{intent}' via={rut['via']}")
 
-        # El router ya vio de qué tipo es: se lo pasamos a la extracción
-        if rut["tipo_sesion"] and not session.get("tipo_sesion"):
-            session["tipo_sesion"] = rut["tipo_sesion"]
+        if intent is None:
+            await context.bot.send_message(
+                chat_id,
+                "😵‍💫 Se me trabó el procesamiento y no entendí tu mensaje. "
+                "¿Me lo repites?"
+            )
+            return
 
-        if intent == "saludo":
+        if intent in INTENTS_REGISTRO:
+            tipo = INTENTS_REGISTRO[intent]
+            if session.get("tipo_sesion") and session["tipo_sesion"] != tipo:
+                # Cambió de tipo a mitad de camino: los campos del otro no aplican
+                validos = set(campos_de(tipo)) | set(campos_opcionales_de(tipo))
+                session["draft"] = {k: v for k, v in session.get("draft", {}).items()
+                                    if k in validos}
+                session["tipo_avisado"] = False
+            session["tipo_sesion"] = tipo
+            # cae a extracción
+
+        elif intent == "corregir":
+            # El tipo ya está fijado por la sesión en curso; sólo extraemos
+            pass
+
+        elif intent in CATEGORIAS_CONSEJO:
+            await responder_consejo(chat_id, user_id, texto, intent, context)
+            return
+
+        elif intent == "consulta_progreso":
+            await responder_consulta_progreso(chat_id, user_id, texto, context)
+            return
+
+        elif intent == "ver_historial":
+            await cmd_historial_chat(chat_id, user_id, context)
+            return
+
+        elif intent == "ver_nivel":
+            await cmd_minivel_chat(chat_id, user_id, context)
+            return
+
+        elif intent == "ver_ultimo_analisis":
+            await cmd_resumen_chat(chat_id, user_id, context)
+            return
+
+        elif intent == "saludo":
             perfil   = obtener_perfil(user_id)
             nivel    = (perfil or {}).get("nivel_actual", "—")
             partidos = (perfil or {}).get("partidos_total", 0)
@@ -1652,75 +1685,38 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
                 chat_id,
                 f"👋 ¡Hola! Soy tu coach de pádel.\n\n"
                 f"📊 Nivel actual: *{nivel}* · Partidos registrados: *{partidos}*\n\n"
-                f"Cuando termines un partido o un entrenamiento cuéntame cómo te fue — "
-                f"por audio o texto.{hist_tip}\n\n"
-                f"También puedes preguntarme:\n"
-                f"• _\"cómo voy\"_ — tu nivel y progreso\n"
-                f"• _\"mis partidos\"_ — historial\n"
-                f"• _\"último análisis\"_ — resumen anterior",
+                f"Cuéntame cómo te fue en un partido o un entrenamiento — por audio "
+                f"o texto, como te salga.{hist_tip}\n\n"
+                f"También puedes preguntarme por un golpe, por una decisión de juego, "
+                f"por los nervios en cancha, o por cómo vienes progresando.",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
-        elif intent == "consulta_tecnica":
-            await responder_consulta_tecnica(chat_id, user_id, texto, context)
-            return
-        elif intent == "historial":
-            await cmd_historial_chat(chat_id, user_id, context)
-            return
-        elif intent == "minivel":
-            await cmd_minivel_chat(chat_id, user_id, context)
-            return
-        elif intent == "resumen":
-            await cmd_resumen_chat(chat_id, user_id, context)
-            return
-        elif intent == "nuevo":
-            historial = obtener_historial(user_id, limite=5)
-            sessions[chat_id] = {
-                "draft": {}, "step": "waiting_input", "pending_field": None,
-                "historial": historial,
-                "tipo_sesion": rut["tipo_sesion"],
-                # Si el jugador nombró el tipo, no hace falta avisárselo después
-                "tipo_confirmado": bool(rut["tipo_sesion"]),
-            }
-            que = etiqueta_tipo(rut["tipo_sesion"]) if rut["tipo_sesion"] else "partido o entrenamiento"
-            await context.bot.send_message(chat_id, f"✅ Listo. Cuéntame del {que}.")
-            return
+
         elif intent == "ayuda":
+            await context.bot.send_message(chat_id, TEXTO_AYUDA,
+                                           parse_mode=ParseMode.MARKDOWN)
+            return
+
+        elif intent == "fuera_de_alcance":
             await context.bot.send_message(
                 chat_id,
-                "🎾 *Puedo ayudarte con:*\n\n"
-                "• Contarme de un partido o un entrenamiento (audio o texto)\n"
-                "• _\"cómo voy\"_ — tu nivel y progreso\n"
-                "• _\"mis partidos\"_ — historial\n"
-                "• _\"último análisis\"_ — resumen de la sesión anterior\n"
-                "• _\"nuevo partido\"_ / _\"nuevo entrenamiento\"_ — empezar registro\n\n"
-                "Distingo solo si me cuentas un partido o un entrenamiento, "
-                "y si me equivoco lo puedes corregir con un botón.\n\n"
-                "No necesitas usar comandos con `/` — escribe nomás.",
-                parse_mode=ParseMode.MARKDOWN
+                "🎾 Eso se me escapa — soy tu coach de pádel y sólo sé de eso.\n\n"
+                "Cuéntame de un partido o un entrenamiento, pregúntame por un golpe "
+                "o por cómo vienes progresando."
             )
             return
-        # intent == "reporte" — continúa a extracción
 
-    # Extracción de datos del partido
-    # Tipo de sesión: keywords obvias primero; si son ambiguas, decide Claude
-    # dentro de extraer_datos_claude() y lo devuelve en la clave "tipo_sesion".
-    tipo_sesion = session.get("tipo_sesion") or detectar_tipo_sesion(texto)
-    log.info(f"tipo_sesion por keywords/sesión = {tipo_sesion}")
+    # ── Extracción ───────────────────────────────────────────────────────────
+    # El tipo de sesión ya lo decidió el router; acá sólo se sacan los campos.
+    tipo_sesion = normalizar_tipo(session.get("tipo_sesion"))
+    session["tipo_sesion"] = tipo_sesion
 
     # El historial que sirve de baseline es el del mismo tipo de sesión
-    historial_ctx = session.get("historial", [])
-    if tipo_sesion:
-        historial_ctx = [p for p in historial_ctx
-                         if normalizar_tipo(p.get("tipo_sesion")) == tipo_sesion]
+    historial_ctx = [p for p in session.get("historial", [])
+                     if normalizar_tipo(p.get("tipo_sesion")) == tipo_sesion]
 
     extraido = extraer_datos_claude(texto, session["draft"], historial_ctx, tipo_sesion)
-    tipo_claude = extraido.pop("tipo_sesion", None) if extraido else None
-    if tipo_sesion is None and tipo_claude in TIPOS_SESION:
-        tipo_sesion = tipo_claude
-        log.info(f"tipo_sesion desempatado por Claude = {tipo_sesion}")
-
-    session["tipo_sesion"] = normalizar_tipo(tipo_sesion)
     # Avisar una sola vez, y sólo si el jugador no dijo él mismo de qué se trata
     hay_que_avisar = not (session.get("tipo_confirmado") or session.get("tipo_avisado"))
     log.info(f"extraido keys={list(extraido.keys()) if extraido else 'vacío'}")
@@ -1744,12 +1740,10 @@ async def procesar_texto_libre(chat_id: int, user_id: int, username: str,
     else:
         await context.bot.send_message(
             chat_id,
-            "🤔 No pude entender eso como datos de un partido ni de un entrenamiento.\n\n"
+            "🤔 Entendí que me hablabas de una sesión, pero no logré sacarle datos.\n\n"
             "Cuéntame cómo te fue — por ejemplo:\n"
             "_\"Ganamos 6-4 6-2 contra rivales de 4ta, el saque estuvo bien pero cometimos errores en la red\"_\n"
-            "_\"Entrené una hora de bandeja con el profe, salió mejor que la vez pasada\"_\n\n"
-            "O si quieres hacer otra cosa:\n"
-            "• _\"cómo voy\"_ · _\"mis partidos\"_ · _\"último análisis\"_ · _\"ayuda\"_",
+            "_\"Entrené una hora de bandeja con el profe, salió mejor que la vez pasada\"_",
             parse_mode=ParseMode.MARKDOWN
         )
 
@@ -1995,7 +1989,10 @@ async def cmd_nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id  = update.effective_chat.id
     # /nuevo entrenamiento — o /nuevo a secas y lo deduce del primer mensaje
     arg        = " ".join(context.args or [])
-    tipo_nuevo = detectar_tipo_sesion(arg) if arg else None
+    tipo_nuevo = None
+    if arg:
+        intent_arg = clasificar_mensaje(arg).get("intent")
+        tipo_nuevo = INTENTS_REGISTRO.get(intent_arg)
     historial  = obtener_historial(user_id, limite=5)
     sessions[chat_id] = {
         "draft": {}, "step": "waiting_input",

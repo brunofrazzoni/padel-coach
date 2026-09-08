@@ -109,44 +109,81 @@ También funciona con entrenamientos:
 
 ## Cómo entiende el bot lo que le escribes
 
-El ruteo de mensajes es **semántico**, no por keywords. `clasificar_mensaje()` en
-`bot.py` decide en una sola llamada qué quiere el jugador y, si está reportando una
-sesión, de qué tipo es.
+**No queda ninguna detección por texto.** Ni keywords, ni prefijos, ni expresiones
+regulares. El jugador escribe o dicta como le sale y `clasificar_mensaje()` decide
+qué quiere, en una sola llamada al modelo.
 
-Antes el ruteo era puramente por keywords y fallaba en dos patrones muy frecuentes:
+Los keywords se sacaron porque matcheaban por prefijo y substring, y fallaban **9 de
+16** frases realistas. Los dos patrones que más dolían:
 
-- **Saludo con reporte pegado.** `detectar_intent()` matcheaba por prefijo, así que
-  "hola, ganamos 6-4" se clasificaba como saludo y **el reporte se perdía entero**.
-- **Audio transcrito sin signos de pregunta.** Whisper rara vez escribe "?", y la regla
-  para consultas técnicas lo exigía. "Me gustaría saber cómo mejorar mi salida de pared"
-  caía a reporte y el bot le buscaba un marcador.
+- **Saludo con reporte pegado.** "hola, ganamos 6-4" empezaba con `"hola, "`, así que
+  se clasificaba como saludo y **el reporte se perdía entero**.
+- **Audio sin signos de pregunta.** Whisper rara vez escribe "?", y la regla de
+  consultas técnicas lo exigía. Toda pregunta dictada caía a reporte.
 
-Contra 16 frases realistas, el ruteo por keywords fallaba 9.
+### Las 13 intenciones
 
-El router mantiene un **fast path gratis** para coincidencias exactas ("hola",
-"mis partidos", "cómo voy" a secas), que es donde los keywords nunca se equivocan.
-Todo lo demás va al modelo.
+Están en el diccionario `INTENTS` de `bot.py`, con su descripción. Esa descripción y
+los pares de `EJEMPLOS_ROUTER` **son el entrenamiento del router**: si el bot confunde
+dos intenciones, se corrige agregando un ejemplo que las separe, no tocando código.
 
-| | Camino | Costo |
+| Grupo | Intenciones |
+|---|---|
+| Registrar | `registrar_partido`, `registrar_entrenamiento`, `corregir` |
+| Consejos | `consejo_tecnico`, `consejo_tactico`, `consejo_emocional` |
+| Sus datos | `consulta_progreso`, `ver_historial`, `ver_nivel`, `ver_ultimo_analisis` |
+| Conversación | `saludo`, `ayuda`, `fuera_de_alcance` |
+
+Las tres de consejo mapean a la columna `categoria` de `conocimiento_padel`
+(técnica / táctica / emocional), así que la búsqueda se filtra por dimensión: una
+pregunta sobre nervios ya no se responde con la empuñadura de la bandeja. El consejo
+emocional además inyecta los promedios del propio jugador en ansiedad, foco, gestión
+de errores y comunicación, para que no salga genérico.
+
+`consulta_progreso` es distinta de `ver_historial`: la segunda lista sesiones, la
+primera lee el historial completo y **saca una conclusión** ("¿mejoré el saque?",
+"¿me va mejor contra 4ta?"). El prompt le exige decir que no sabe cuando los datos no
+alcanzan, en vez de inventar una tendencia.
+
+### Sin respaldo por keywords
+
+El router reintenta una vez. Si tampoco así obtiene una intención válida, devuelve
+`intent=None` y el bot le pide al jugador que repita.
+
+**Esto es un cambio de comportamiento a tener presente:** antes un fallo del
+clasificador caía a keywords y el bot seguía funcionando peor pero funcionando. Ahora
+una caída del modelo deja el ruteo inoperante. Es el precio de no tener dos caminos
+que mantener en paralelo — y de que el respaldo por keywords, en la práctica, acertaba
+menos de la mitad de las veces.
+
+### Modelos
+
+Todas las llamadas corren en `claude-haiku-4-5`. Cada una tiene su constante y se
+puede sobreescribir por variable de entorno, sin redeployar:
+
+| Constante | Para qué | Variable de entorno |
 |---|---|---|
-| Frase exacta | tabla `FRASES_EXACTAS` | $0, sin latencia |
-| Cualquier otra cosa | `MODELO_ROUTER` (Haiku 4.5) | ~$0.0005/mensaje |
-| Si la llamada falla | `detectar_intent()` + `detectar_tipo_sesion()` | $0 |
+| `MODELO_ROUTER` | clasificar la intención | `MODELO_ROUTER` |
+| `MODELO_EXTRACCION` | sacar campos del relato | `MODELO_EXTRACCION` |
+| `MODELO_ANALISIS` | el análisis del coach | `MODELO_ANALISIS` |
+| `MODELO_CONSEJO` | responder consultas | `MODELO_CONSEJO` |
+| `MODELO_NIVEL` | inferir la categoría | `MODELO_NIVEL` |
 
-El respaldo por keywords se conserva a propósito: un fallo del clasificador nunca debe
-hacer que se pierda el mensaje del jugador, aunque el ruteo salga peor.
-
-**Modelos:** el router usa `claude-haiku-4-5` porque clasificar es corto y frecuente.
-La extracción y el análisis siguen en Sonnet — ahí es donde está el valor.
+> ⚠️ **`MODELO_ANALISIS` es el más sensible.** El análisis del coach es el producto:
+> detectar patrones entre sesiones, celebrar progresos con evidencia y dar una
+> prioridad que no suene de manual. Es donde un modelo más grande se nota. Si el
+> análisis empieza a salir genérico, la primera palanca es
+> `MODELO_ANALISIS=claude-sonnet-4-6` en el entorno — la diferencia de costo es de
+> unos pocos dólares al mes.
 
 ## Partidos vs entrenamientos
 
-Si el router no logra decidir el tipo (un texto mixto como "entrenamos y después
-jugamos un partido"), queda una última red: la clasificación viaja dentro de la misma
-llamada de extracción (`extraer_datos_claude()`), que devuelve la clave `tipo_sesion`
-junto con los datos. Eso no agrega llamadas a la API.
+El tipo queda decidido por la intención: `registrar_partido` o
+`registrar_entrenamiento`. `extraer_datos_claude()` ya no clasifica nada — recibe el
+tipo resuelto y sólo saca los campos, así que tiene un único camino.
 
 Tras la primera extracción el bot avisa qué detectó y ofrece un botón para corregirlo.
+Si el jugador lo corrige, los campos que no aplican al otro tipo se descartan.
 
 Diferencias por tipo:
 
